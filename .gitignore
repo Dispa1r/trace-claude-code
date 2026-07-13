@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+.venv/
+.work/
+*.pyc
+
+# runtime output
+/tmp/
+claude-hook-network/
+claude-hook-sources/
+*.jsonl
+
+# local copies
+claude-hookable
