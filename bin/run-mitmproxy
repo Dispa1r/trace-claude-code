@@ -1,0 +1,19 @@
+#!/bin/sh
+
+set -eu
+
+MITMDUMP=${MITMDUMP:-mitmdump}
+MITM_HOST=${MITM_HOST:-127.0.0.1}
+MITM_PORT=${MITM_PORT:-8080}
+OUTPUT_DIR=${TRACE_CLAUDE_OUTPUT_DIR:-"$HOME/.local/state/trace-claude-code"}
+HAR_FILE=${MITM_HAR_FILE:-"$OUTPUT_DIR/claude-$(date +%Y%m%d-%H%M%S).har"}
+
+mkdir -p "$OUTPUT_DIR"
+printf 'mitmproxy listen: http://%s:%s\n' "$MITM_HOST" "$MITM_PORT"
+printf 'HAR output: %s\n' "$HAR_FILE"
+
+exec "$MITMDUMP" \
+  --listen-host "$MITM_HOST" \
+  --listen-port "$MITM_PORT" \
+  --set "hardump=$HAR_FILE" \
+  "$@"

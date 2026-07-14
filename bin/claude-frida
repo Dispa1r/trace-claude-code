@@ -1,0 +1,19 @@
+#!/bin/sh
+
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PRELOAD=${CLAUDE_PRELOAD_SCRIPT:-"$ROOT/preload/claude_preload.js"}
+FRIDA_PYTHON=${FRIDA_PYTHON:-python3}
+CLAUDE_TARGET=${CLAUDE_DEBUGGABLE_BINARY:-${CLAUDE_BINARY:-"$HOME/.local/share/trace-claude-code/claude-debuggable"}}
+
+if [ -n "${BUN_OPTIONS:-}" ]; then
+  export BUN_OPTIONS="--preload=${PRELOAD} ${BUN_OPTIONS}"
+else
+  export BUN_OPTIONS="--preload=${PRELOAD}"
+fi
+
+exec "$FRIDA_PYTHON" "$ROOT/frida/launcher.py" \
+  --spawn \
+  --binary "$CLAUDE_TARGET" \
+  -- "$@"

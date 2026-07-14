@@ -1,0 +1,21 @@
+#!/bin/sh
+
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+MITM_HOST=${MITM_HOST:-127.0.0.1}
+MITM_PORT=${MITM_PORT:-8080}
+MITM_PROXY="http://${MITM_HOST}:${MITM_PORT}"
+MITMPROXY_CA_CERT=${MITMPROXY_CA_CERT:-"$HOME/.mitmproxy/mitmproxy-ca-cert.pem"}
+
+if [ ! -f "$MITMPROXY_CA_CERT" ]; then
+  printf 'mitmproxy CA certificate not found: %s\n' "$MITMPROXY_CA_CERT" >&2
+  printf 'Start bin/run-mitmproxy once so mitmproxy creates its CA.\n' >&2
+  exit 1
+fi
+
+export HTTP_PROXY="$MITM_PROXY" HTTPS_PROXY="$MITM_PROXY" ALL_PROXY="$MITM_PROXY"
+export http_proxy="$MITM_PROXY" https_proxy="$MITM_PROXY" all_proxy="$MITM_PROXY"
+export NODE_EXTRA_CA_CERTS="$MITMPROXY_CA_CERT"
+
+exec "$ROOT/bin/claude-hooked" "$@"

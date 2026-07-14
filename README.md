@@ -1,98 +1,163 @@
-# Claude Code hook probes
+# trace-claude-code
 
-This directory contains two complementary probes for the arm64 Claude Code
-2.1.204 standalone executable.
+Claude Code 2.1.204 tracing and traffic-capture toolkit for macOS. It combines
+same-runtime Bun preload hooks, precise JavaScript `Proxy` wrappers, correlated
+network JSONL tracing, optional Frida native hooks, and mitmproxy HAR capture.
 
-## Native JSC trace
+Use it only on software and traffic you are authorized to inspect. Trace files
+can contain prompts, source code, tool results, identifiers, and credentials.
+They are ignored by Git and should be handled as sensitive data.
 
-The original Developer ID signature does not allow debugger attachment on this
-machine. `prepare-hookable-copy.sh` creates an APFS clone-copy and ad-hoc signs
-that copy with JIT, library-loading, and task-debugging entitlements. It never
-modifies the installed binary.
+## What is included
 
-The runner launches that copy under the system LLDB. A Python breakpoint script
-logs entry registers, matches the function's statically verified return sites,
-and logs the encoded `JSValue` in `x0` on return.
+| Layer | Entry point | Coverage |
+|---|---|---|
+| Bun preload | `bin/claude-hooked` | `fetch`, Bun spawn hooks, precise module/object method proxies |
+| Network JSONL | `preload/network_trace.js` | fetch, HTTP/1, HTTP/2, WebSocket, Bun/net/TLS connections |
+| MITM capture | `bin/run-mitmproxy` + `bin/claude-mitm` | decrypted HTTP(S) flows and HAR output |
+| Native tracing | `bin/claude-frida` | `dlopen`, `napi_run_script`, `connect`, version-specific Bun/JSC evaluator |
+| Viewer | `bin/show-network-trace` | correlates requests, responses, errors, and optional connection records |
 
-```sh
-./run-native-trace.sh --version
-```
+The preload path is the recommended starting point. It runs in Claude Code's
+own Bun `globalThis`, so JavaScript objects can be wrapped without guessing
+native layouts. Frida is useful for native boundaries and version-specific
+internal evaluator work.
 
-Trace records are written as JSONL to stderr. Set `CC_HOOK_LOG` to keep them in
-a file while leaving Claude's terminal UI on stdout:
-
-```sh
-CC_HOOK_LOG=/tmp/claude-jsc.jsonl ./run-native-trace.sh
-```
-
-The IDA-confirmed boundaries are:
-
-| Function | IDA address | Image offset |
-| --- | ---: | ---: |
-| `JSC::evaluate` | `0x102ab0c88` | `0x02ab0c88` |
-| `Interpreter::executeProgram` | `0x102820eec` | `0x02820eec` |
-| `JSC::call(..., Exception&)` | `0x102a850cc` | `0x02a850cc` |
-| `Interpreter::executeCall` | `0x102822ce0` | `0x02822ce0` |
-| `Interpreter::executeCallImpl` | `0x102822914` | `0x02822914` |
-
-`native_lldb.py` enables `evaluate` and `executeCall` by default. Override that
-with `CC_HOOKS=evaluate`, `CC_HOOKS=call`, `CC_HOOKS=executeCall`, or
-`CC_HOOKS=executeCallImpl`. Results are raw encoded `JSValue` records with safe
-decoding for empty, null, undefined, booleans, int32 values, and cell
-pointers. For `CallData::JS`, the first sample of each `FunctionExecutable`
-also includes a compact memory snapshot and heuristic `SourceCode` candidates,
-so we can recover source ranges without re-entering JSC. A cell pointer is not
-converted to a JavaScript string from the breakpoint callback because
-re-entering JSC at arbitrary points can corrupt VM state.
-
-`native-trace.js` is the equivalent Frida proof. Frida 17.15.4 hit the same
-addresses successfully once, but its helper crashes repeatedly on this macOS
-26.4.1 machine, so it is not used by the runner.
-
-For large JSONL traces, summarize the hottest native callbacks and the first
-sampled JS executables with:
+## Quick start: JSONL network trace
 
 ```sh
-python3 ./summarize-trace.py /tmp/claude-jsc.jsonl
+git clone https://github.com/Dispa1r/trace-claude-code.git
+cd trace-claude-code
+chmod +x bin/* scripts/*
+
+CLAUDE_NETWORK_TRACE_DIR="$PWD/traces" \
+  bin/claude-hooked -p 'only reply OK'
+
+bin/show-network-trace --directory "$PWD/traces" --headers --bodies
 ```
 
-If `output/claude/claude.js` is present, the summarizer automatically maps the
-main anonymous Claude bundle wrapper back to its source offsets and prints a
-short excerpt. Override that path or tune the preview size with:
+Without `CLAUDE_NETWORK_TRACE_DIR`, output is written to:
+
+```text
+${XDG_STATE_HOME}/trace-claude-code
+~/.local/state/trace-claude-code
+```
+
+Network bodies are capped at 2 MiB per request. Authentication, API key,
+cookie, token, password, and secret fields are redacted by default, but prompts
+and project data are intentionally captured. Useful controls:
 
 ```sh
-python3 ./summarize-trace.py /tmp/claude-jsc.jsonl --bundle /path/to/claude.js --excerpt-context 64 --excerpt-limit 240
+export CLAUDE_NETWORK_TRACE=0                    # disable network tracing
+export CLAUDE_NETWORK_TRACE_MAX_BODY=4194304     # body cap in bytes
+export CLAUDE_NETWORK_TRACE_STDERR=1             # one-line request summaries
+export CLAUDE_NETWORK_TRACE_SOCKET_WRITES=1      # raw socket writes; very noisy
+export CLAUDE_NETWORK_TRACE_SECRETS=1            # disable redaction; dangerous
 ```
 
-## Native network trace
+## Precise JavaScript method tracing
 
-`native_lldb.py` also supports a best-effort native network trace. It installs
-symbol breakpoints for `connect`, `send`, `write`, `writev`, `sendmsg`, and
-tries `SSL_write` when symbol names are available. This reliably captures
-destination metadata and plaintext payloads for many HTTP/HTTP proxy requests.
-For HTTPS, plaintext request bodies are only visible if an `SSL_write` hook is
-resolved; otherwise socket writes are encrypted and you will only see connect
-metadata plus encrypted payload chunks.
-
-Use the dedicated runner:
+Edit `preload/preload_user_logic.js` or override targets for one run:
 
 ```sh
-CC_HOOK_LOG=/tmp/claude-net.jsonl ./run-network-trace.sh
+CLAUDE_HOOK_TRACE_TARGETS='[
+  {"object":"globalThis","path":"fetch","label":"globalThis.fetch"},
+  {"module":"node:fs","path":"readFile","label":"fs.readFile"},
+  {"object":"globalThis","path":"Response.prototype.json"}
+]' bin/claude-hooked -p 'only reply OK'
 ```
 
-Useful env knobs:
+Each call emits a `[method-trace]` JSON record on stderr. `callId` links
+`enter` with `return`, `throw`, `resolve`, or `reject`. The wrapper preserves the
+original receiver and return value and does not consume Request/Response bodies.
 
 ```sh
-CC_NET_CAPTURE_READS=1         # also hook read/recv paths
-CC_NET_PREVIEW_BYTES=2048      # preview length stored in JSONL
-CC_NET_DUMP_DIR=/tmp/claude-hook-network
-CC_NET_DUMP_MAX_BYTES=131072   # per-chunk dump cap
+export CLAUDE_HOOK_TRACE_BODY=1   # include prompt/body/content fields
+export CLAUDE_HOOK_TRACE_STACK=1  # include stacks
+export CLAUDE_HOOK_TRACE_THIS=1   # include receiver snapshots
 ```
 
-Payload dumps are written to `CC_NET_DUMP_DIR`. Socket writes are filtered to
-file descriptors that previously hit `connect`, so normal file IO and terminal
-output stay mostly out of the trace.
+## MITM HAR capture
 
-These C++ boundaries cover whole-program evaluation and native-to-JS calls.
-Ordinary JS-to-JS calls made by JIT or LLInt code bypass them. Use Bun's WebKit
-Inspector breakpoints or source instrumentation for lexical bundle functions.
+Install mitmproxy with the required package-download proxy environment:
+
+```sh
+export https_proxy=http://127.0.0.1:7890 \
+       http_proxy=http://127.0.0.1:7890 \
+       all_proxy=socks5://127.0.0.1:7890
+python3 -m pip install mitmproxy
+```
+
+Start the proxy in terminal 1:
+
+```sh
+MITM_PORT=8080 bin/run-mitmproxy
+```
+
+Run Claude through it in terminal 2:
+
+```sh
+MITM_PORT=8080 bin/claude-mitm -p 'only reply OK'
+```
+
+`bin/claude-mitm` sets upper- and lower-case proxy variables plus
+`NODE_EXTRA_CA_CERTS=~/.mitmproxy/mitmproxy-ca-cert.pem`. Stop mitmproxy cleanly
+so its `hardump` option writes the HAR file. Set `MITM_HAR_FILE` to choose an
+exact output path.
+
+## Frida native hooks on macOS
+
+Frida attach/spawn requires macOS developer debugging permission and a target
+signed with `get-task-allow`. Prepare a copy; the installed Claude binary is not
+modified:
+
+```sh
+scripts/prepare-debuggable-claude-macos
+```
+
+Create an environment for the Python bindings. Export the download proxy before
+installing dependencies:
+
+```sh
+export https_proxy=http://127.0.0.1:7890 \
+       http_proxy=http://127.0.0.1:7890 \
+       all_proxy=socks5://127.0.0.1:7890
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-frida.txt
+```
+
+Then run:
+
+```sh
+FRIDA_PYTHON="$PWD/.venv/bin/python" bin/claude-frida --version
+```
+
+On hardened macOS setups the Python interpreter used by Frida may also need the
+debugger entitlement from `entitlements/frida-debugger.entitlements`. Sign a
+copy of the interpreter rather than modifying a system or Xcode installation.
+
+Native hooks live in `frida/agent.js`; callbacks belong in
+`frida/user_logic.js`. The internal evaluator RVA `0x02AB0C88` is specific to
+Claude Code 2.1.204. Disable it after upgrading until the new function has been
+identified:
+
+```sh
+FRIDA_PYTHON="$PWD/.venv/bin/python" \
+  "$PWD/frida/launcher.py" --spawn --no-internal-evaluate -- --version
+```
+
+## Capture safety
+
+- JSONL, HAR, mitmproxy flow files, signed binaries, and local runtime folders
+  are excluded by `.gitignore`.
+- Header and common JSON secret fields are redacted by default.
+- Body capture can still include prompts, repository contents, device/session
+  identifiers, and tool results.
+- Review every capture before sharing it. Do not rely on automatic redaction as
+  the only privacy control.
+
+## Version scope
+
+The Bun preload and network wrappers are mostly version-tolerant. Native
+offsets and some reachable JavaScript object paths are not. The checked-in
+offset map currently targets Claude Code 2.1.204.

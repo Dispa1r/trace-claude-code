@@ -1,0 +1,26 @@
+#!/bin/sh
+
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+SOURCE=${CLAUDE_BINARY:-/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe}
+TARGET=${CLAUDE_DEBUGGABLE_BINARY:-"$HOME/.local/share/trace-claude-code/claude-debuggable"}
+
+if [ "$(uname -s)" != Darwin ]; then
+  printf 'This helper is only for macOS.\n' >&2
+  exit 1
+fi
+if [ ! -f "$SOURCE" ]; then
+  printf 'Claude binary not found: %s\n' "$SOURCE" >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname -- "$TARGET")"
+cp "$SOURCE" "$TARGET"
+chmod +x "$TARGET"
+codesign --force --sign - \
+  --entitlements "$ROOT/entitlements/claude-debuggable.entitlements" \
+  "$TARGET"
+
+printf 'Prepared debuggable Claude copy: %s\n' "$TARGET"
+printf 'Original left untouched: %s\n' "$SOURCE"

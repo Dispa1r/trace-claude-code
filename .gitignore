@@ -1,14 +1,17 @@
 .DS_Store
 __pycache__/
 .venv/
-.work/
 *.pyc
 
-# runtime output
-/tmp/
-claude-hook-network/
-claude-hook-sources/
+# Captures can contain prompts, source code, identifiers, and credentials.
 *.jsonl
+*.har
+*.flow
+*.flows
+captures/
+traces/
+output/
 
-# local copies
-claude-hookable
+# Local signed binaries and debugger runtimes.
+.runtime/
+claude-debuggable

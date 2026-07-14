@@ -1,0 +1,15 @@
+#!/bin/sh
+
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PRELOAD=${CLAUDE_PRELOAD_SCRIPT:-"$ROOT/preload/claude_preload.js"}
+CLAUDE_BIN=${CLAUDE_BIN:-$(command -v claude)}
+
+if [ -n "${BUN_OPTIONS:-}" ]; then
+  export BUN_OPTIONS="--preload=${PRELOAD} ${BUN_OPTIONS}"
+else
+  export BUN_OPTIONS="--preload=${PRELOAD}"
+fi
+
+exec "$CLAUDE_BIN" "$@"
