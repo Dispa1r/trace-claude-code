@@ -23,6 +23,23 @@ own Bun `globalThis`, so JavaScript objects can be wrapped without guessing
 native layouts. Frida is useful for native boundaries and version-specific
 internal evaluator work.
 
+## Analysis documents and probes
+
+For the detailed telemetry and attribution analysis used during reverse
+engineering, see:
+
+- `docs/telemetry-three-chains.md`
+- `docs/cch-location-method.md`
+
+The main attribution-related probes checked into this repository are:
+
+- `frida/cch_probe.js` — confirms the first outbound native buffer containing
+  `cch=`
+- `frida/cch_mutation_probe.js` — locates the native body-preparation rewrite
+  point and the `XXH64` helper path
+- `preload/cch_hash_probe.js` — JS-side negative control for `createHash`
+  inputs involving `cch=00000`
+
 ## Quick start: JSONL network trace
 
 ```sh

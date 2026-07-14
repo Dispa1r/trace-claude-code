@@ -1,0 +1,843 @@
+# Claude Code 2.1.204 三条遥测链路详解
+
+> 分析对象：macOS arm64，Claude Code `2.1.204`。  
+> 分析日期：2026-07-14（Asia/Shanghai）。  
+> 证据来源：2.1.204 内嵌 JavaScript 静态恢复、Bun preload 网络 JSONL、mitmproxy HAR、本机 `~/.claude.json` GrowthBook 缓存。  
+> 本文包含真实的持久化 `device_id`、session UUID、环境特征和公开的 Datadog client token，应按敏感材料保存。
+
+命名约定：环境变量、feature flag、killswitch、provider 枚举和配置 key 一律保留 Claude Code 2.1.204 中的英文原名；中文只解释作用，不把开关名称翻译成中文别名。
+
+## 结论摘要
+
+| 链路 | 主要用途 | 精确端点 | 本次是否观察到真实网络请求 |
+|---|---|---|---|
+| 1P Event Logging | Claude Code 内部产品事件、性能、工具使用、API 结果和 GrowthBook 实验曝光 | `POST https://api.anthropic.com/api/event_logging/v2/batch` | 是；HAR 中 11 个 batch、240 个事件全部被服务端接受 |
+| Datadog datalog | 经过事件白名单筛选后的扁平化运行日志 | `POST https://http-intake.logs.us5.datadoghq.com/api/v2/logs` | 是；hook 测试中 10 个 batch、96 条事件，捕获到 7 个 HTTP 202 |
+| GrowthBook | 拉取 feature flag/实验分配；通过 SSE 接收配置更新 | `POST https://api.anthropic.com/api/eval/sdk-zAZezfDKGoZuXXKe`；`GET https://api.anthropic.com/sub/sdk-zAZezfDKGoZuXXKe` | 本轮没有；当前无可用于 GrowthBook 的官方 auth header，实际使用磁盘缓存的 13 个 feature 值 |
+
+一个容易混淆的关系是：GrowthBook 的配置拉取属于第三条链，但实验曝光事件不会发往单独的 GrowthBook logging URL，而是转换成 `GrowthbookExperimentEvent` 后进入第一条 1P batch。
+
+## 共同前置概念
+
+### `firstParty` 不等于请求一定发往 Anthropic
+
+2.1.204 的 provider 枚举只排除 Gateway、Bedrock、Vertex、Foundry、Anthropic AWS 和 Mantle；普通的自定义 `ANTHROPIC_BASE_URL` 仍返回 `firstParty`：
+
+```js
+function getAPIProvider() {
+  if (gatewayAuth) return "gateway";
+  if (CLAUDE_CODE_USE_BEDROCK) return "bedrock";
+  if (CLAUDE_CODE_USE_FOUNDRY) return "foundry";
+  if (CLAUDE_CODE_USE_ANTHROPIC_AWS) return "anthropicAws";
+  if (CLAUDE_CODE_USE_MANTLE) return "mantle";
+  if (CLAUDE_CODE_USE_VERTEX) return "vertex";
+  return "firstParty";
+}
+```
+
+因此本机虽然模型请求实际发往 `https://api.deepseek.com/anthropic/v1/messages`，内部事件仍记录：
+
+```text
+provider = firstParty
+model = deepseek-v4-pro
+envModel = deepseek-v4-pro
+baseUrl = efdbb18afca7
+```
+
+### `baseUrl` 的规范化与哈希算法
+
+1P 事件中的 `baseUrl` 来自 `ANTHROPIC_BASE_URL`，不是 SDK 最后拼出的 `/v1/messages?beta=true` 请求 URL。2.1.204 的等价实现如下：
+
+```js
+function normalizeBaseUrl(raw) {
+  if (!raw) return raw;
+
+  try {
+    const url = new URL(raw);
+    if (!url.host) throw new TypeError("opaque");
+
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    // 非标准 URL 的 fallback：去掉 query/fragment，再去掉最后一个 @ 之前的内容。
+    const withoutQueryOrFragment = raw.split("?")[0].split("#")[0];
+    const at = withoutQueryOrFragment.lastIndexOf("@");
+    return at >= 0
+      ? withoutQueryOrFragment.slice(at + 1)
+      : withoutQueryOrFragment;
+  }
+}
+
+function hostnameForDomainCheck(value) {
+  const candidate = value.startsWith("//") ? `https:${value}` : value;
+  let hostname;
+
+  try {
+    hostname = new URL(candidate).hostname;
+  } catch {
+    hostname = value.match(/^[^/:]+/)?.[0] ?? value;
+  }
+
+  return hostname.endsWith(".") ? hostname.slice(0, -1) : hostname;
+}
+
+function isAnthropicDomain(value) {
+  return /(^|\.)(anthropic\.com|claude\.ai|claude\.com)$/i.test(
+    hostnameForDomainCheck(value)
+  );
+}
+
+function telemetryBaseUrl(raw) {
+  const normalized = normalizeBaseUrl(raw);
+
+  // 官方域名保留规范化后的 URL 明文，不做哈希。
+  if (isAnthropicDomain(normalized)) {
+    return normalized;
+  }
+
+  // crypto.update(string) 使用 UTF-8；结果为小写 hex 的前 12 位。
+  return crypto
+    .createHash("sha256")
+    .update(normalized)
+    .digest("hex")
+    .slice(0, 12);
+}
+```
+
+当前真实输入和结果：
+
+```text
+ANTHROPIC_BASE_URL = https://api.deepseek.com/anthropic
+normalized         = https://api.deepseek.com/anthropic
+SHA-256 prefix     = efdbb18afca7
+1P baseUrl         = efdbb18afca7
+```
+
+可直接复算：
+
+```sh
+printf '%s' 'https://api.deepseek.com/anthropic' | shasum -a 256 | cut -c1-12
+# efdbb18afca7
+```
+
+路径会参与哈希，但末尾 `/`、URL credentials、query 和 fragment 不会参与：
+
+| 原始值 | 规范化值 | 1P `baseUrl` |
+|---|---|---|
+| `https://api.deepseek.com` | `https://api.deepseek.com` | `a34e2a4708ed` |
+| `https://api.deepseek.com/` | `https://api.deepseek.com` | `a34e2a4708ed` |
+| `https://api.deepseek.com/anthropic` | `https://api.deepseek.com/anthropic` | `efdbb18afca7` |
+| `https://api.deepseek.com/anthropic/v1` | `https://api.deepseek.com/anthropic/v1` | `38be6316416c` |
+
+注意：GrowthBook 的 `attributes.apiBaseUrlHost` 不复用这套哈希逻辑，而是通过 `new URL(ANTHROPIC_BASE_URL).host` 采集明文 host；本机真实值为 `api.deepseek.com`。
+
+### 模型请求中的 attribution payload 与其他常见 request header 生成方式
+
+`x-anthropic-billing-header` 在 2.1.204 里容易看错：对 DeepSeek-compatible `/v1/messages` 请求，Bun preload JSONL 看到的是 `system[0].text` 里的 attribution 文本，不一定是最终 wire body。当前这份 capture 目录里的普通 JSONL 只能看到：
+
+```text
+x-anthropic-billing-header: cc_version=2.1.204.<fp>; cc_entrypoint=sdk-cli;
+```
+
+而受控 Frida/native probe 证明：`cch` 不是在 JavaScript `fetch` 层生成，而是在 native body prepare 阶段才补进最终 body，所以普通 preload 抓不到并不代表它不存在。
+
+#### `x-anthropic-billing-header` 三个子字段
+
+| 子字段 | 生成方式 | 当前可验证的真实值/样例 |
+|---|---|---|
+| `cc_version` | `VERSION + "." + fp3`；其中 `fp3 = sha256("59cf53e54c78" + msg[4] + msg[7] + msg[20] + VERSION).hex().slice(0, 3)` | `2.1.204.5a7`、`2.1.204.9b9` |
+| `cc_entrypoint` | 直接取 `CLAUDE_CODE_ENTRYPOINT` | `sdk-cli` |
+| `cch` | native `sub_10142D258` 中对 prepared JSON body 做 `XXH64(seed=0x4d659218e32a3268)`；跳过 `"model":"<value>"` 的 value，取 digest 低 20 bit 编成 5 位小写 hex，再原地覆写 `cch=00000` | `d004c`、`c1f8f`、`92d13` |
+
+这里 `msg` 不是 wrapper 后的第一段 `<system-reminder>`，而是“本轮第一个真实用户文本”。当前可复算的两个样例：
+
+| 场景 | `msg` 取值 | `msg[4]`/`msg[7]`/`msg[20]` | 结果 |
+|---|---|---|---|
+| title request | `<session>\nUse the Bash tool ...` | `s` / `n` / `s` | `5a7` |
+| 主模型请求 | `Use the Bash tool to execute pwd. Then reply ...` | `t` / ` ` / ` ` | `9b9` |
+
+第二个例子尤其能说明 wrapper 不是输入：如果错误地对 `<system-reminder>...` 那段文本取 `msg[4]`/`msg[7]`/`msg[20]`，当前同一请求只会得到 `43c`，而真实值是 `9b9`。
+
+等价实现可写成：
+
+```js
+const BILLING_SALT = "59cf53e54c78";
+
+function ccVersionFingerprint(msg, version) {
+  return crypto
+    .createHash("sha256")
+    .update(BILLING_SALT + msg[4] + msg[7] + msg[20] + version)
+    .digest("hex")
+    .slice(0, 3);
+}
+
+function cchValue(preparedBodyBytes) {
+  // native sub_10142D258:
+  // 1. find "system":[
+  // 2. find cch=00000
+  // 3. XXH64(body, seed=0x4d659218e32a3268), but skip `"model":"<value>"` value bytes
+  // 4. return lower 20 bits as five lowercase hex chars
+}
+```
+
+受控同进程 probe 的直接证据：
+
+| XXH64 digest | 低 20 bit | body 中真实改写后的 `cch` |
+|---|---|---|
+| `0x232b8b0fc55d004c` | `0xd004c` | `cch=d004c` |
+| `0xe8224a7adaac1f8f` | `0xc1f8f` | `cch=c1f8f` |
+
+#### 其他常见 model request header / probe 生成方式
+
+| Header / 请求 | 生成方式 | 当前真实值/观察结果 |
+|---|---|---|
+| `Accept` | 固定常量 | `application/json` |
+| `Content-Type` | 固定常量 | `application/json` |
+| `User-Agent`（模型请求） | `claude-cli/${VERSION} (${userType}, ${CLAUDE_CODE_ENTRYPOINT})` | `claude-cli/2.1.204 (external, sdk-cli)` |
+| `x-app` | 固定常量 | `cli` |
+| `x-claude-code-session-id` | 当前 Claude 会话 UUID | 例如 `c48ed5af-3a6d-4e29-9278-7078aa29f703` |
+| `anthropic-version` | 固定 API version | `2023-06-01` |
+| `anthropic-dangerous-direct-browser-access` | 固定常量 | `true` |
+| `anthropic-beta` | 按请求类型拼好 beta 列表后 `join(",")`；title 请求和主模型请求的列表不完全相同 | title 请求：`claude-code-20250219,...,mid-conversation-system-2026-04-07,effort-2025-11-24,structured-outputs-2025-12-15`；主模型请求：`interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219` |
+| `x-stainless-*` | 来自 bundled Anthropic JS SDK / Stainless runtime 元数据，不是 Claude 产品层自己拼接 | `x-stainless-arch=arm64`、`x-stainless-lang=js`、`x-stainless-os=MacOS`、`x-stainless-package-version=0.94.0`、`x-stainless-retry-count=0`、`x-stainless-runtime=node`、`x-stainless-runtime-version=v26.3.0`、`x-stainless-timeout=600` |
+| `Authorization` / `x-api-key` | 取当前 upstream auth resolution；对自定义 DeepSeek-compatible base URL，当前捕获里只看到被 redact 的 `authorization` | GrowthBook 是否发起 `/api/eval` 也依赖“官方 auth header resolution 是否成功” |
+| `HEAD <ANTHROPIC_BASE_URL>` probe | 发送 `HEAD` 到 base URL，本轮观测到没有附带自定义 header | 看到 `HEAD https://api.deepseek.com/anthropic`；official baseline 还看到一次 `HEAD https://api.anthropic.com` |
+
+---
+
+## 1. 1P Event Logging
+
+### 1.1 触发与发送路径
+
+内部事件首先通过统一的 `logEvent`/`logEventAsync` 入口产生，然后转换成 OpenTelemetry log record，最终由 1P exporter 组装成 batch：
+
+```text
+产品逻辑触发 tengu_* 事件
+  -> 收集 core/env/auth/process/event metadata
+  -> OpenTelemetry logger 队列
+  -> transformLogsToEvents()
+  -> { events: [...] }
+  -> /api/event_logging/v2/batch
+```
+
+主要门控（开关均使用 2.1.204 英文原名）：
+
+| 原始名称/条件 | 允许发送的条件 | 作用 |
+|---|---|---|
+| `getAPIProvider() === "firstParty"` | 为真 | 自定义 DeepSeek `ANTHROPIC_BASE_URL` 仍满足该 provider 枚举；`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` 为真时可绕过这一 provider 限制 |
+| runtime `gatewayAuth` / `CLAUDE_CODE_USE_GATEWAY` | 没有进入 Gateway auth 状态 | Gateway 状态会关闭 1P exporter |
+| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | 未设置 | 设置后 traffic mode 为 `essential-traffic`，关闭 1P |
+| `DISABLE_TELEMETRY` | 未设置 | 设置后 traffic mode 为 `no-telemetry`，关闭 1P |
+| `DO_NOT_TRACK` | 未解析为 truthy | truthy 时 traffic mode 为 `no-telemetry`，关闭 1P |
+| `tengu_frond_boric.firstParty` | 不为 `true` | 1P killswitch |
+| `tengu_event_sampling_config.<event>.sample_rate` | 未命中 `0` 或随机采样保留 | 单事件采样；`0` 直接丢弃，`0 < sample_rate < 1` 随机保留 |
+
+### 1.2 端点、认证和 batch 参数
+
+当前默认端点：
+
+```text
+POST https://api.anthropic.com/api/event_logging/v2/batch
+```
+
+基础请求头：
+
+| Header | 生成方式 | 当前真实值/说明 |
+|---|---|---|
+| `Content-Type` | 固定常量 | `application/json` |
+| `User-Agent` | `claude-code/${VERSION}` | `claude-code/2.1.204` |
+| `x-service-name` | 固定常量 | `claude-code` |
+| `Authorization` / `x-api-key` | 官方 auth header resolution；首发请求可带认证，401/特定失败路径可去掉认证重试 | 当前代表性请求中未出现 |
+
+本机 GrowthBook 缓存中的实际 batch 配置：
+
+```json
+{
+  "scheduledDelayMillis": 5000,
+  "maxExportBatchSize": 200,
+  "maxQueueSize": 8192
+}
+```
+
+实现还包含失败事件本地文件队列，文件名前缀为 `1p_failed_events.`，并支持 backoff、批量重试和最大尝试次数。
+
+### 1.3 顶层结构
+
+```json
+{
+  "events": [
+    {
+      "event_type": "ClaudeCodeInternalEvent",
+      "event_data": {}
+    }
+  ]
+}
+```
+
+当前能明确确认的 `event_type`：
+
+| `event_type` | 来源 |
+|---|---|
+| `ClaudeCodeInternalEvent` | 普通 `tengu_*` 内部事件 |
+| `GrowthbookExperimentEvent` | GrowthBook 实验曝光；仍通过 1P endpoint 发送 |
+
+### 1.4 `ClaudeCodeInternalEvent` 字段表
+
+| Key | 含义 | 采集方式 | 本次真实值/示例 |
+|---|---|---|---|
+| `event_id` | 单事件 UUID | `crypto.randomUUID()` | `794e4f20-06a1-428a-9de6-f501e192a1fa` |
+| `event_name` | 产品事件名 | 调用方传入 | `tengu_api_success` |
+| `client_timestamp` | 客户端事件时间 | 当前时间转换为 ISO-8601 | `2026-07-14T05:32:35.284Z` |
+| `device_id` | 持久设备标识 | Claude Code 本地 device ID 生成/读取链 | `3a232b1a1d788667a15e0720564540eb32345f739c5a36ec20f91587c1f6d93d` |
+| `session_id` | Claude 会话 UUID | 会话状态 | `4573af8e-cfbb-448c-a761-e8904186d295` |
+| `model` | 当前内部模型名 | 模型选择状态 | `deepseek-v4-pro` |
+| `user_type` | 用户类型 | 固定/账户上下文 | `external` |
+| `betas` | 启用的 beta 列表 | 请求 beta 配置拼接 | `claude-code-20250219,...,effort-2025-11-24` |
+| `entrypoint` | 运行入口 | `CLAUDE_CODE_ENTRYPOINT` | `sdk-cli` |
+| `is_interactive` | 是否交互式 UI | 运行时状态 | `false` |
+| `client_type` | 客户端类型 | 运行时状态 | `sdk-cli` |
+| `process` | 进程指标 | `process.memoryUsage()`、`process.cpuUsage()` 等；JSON 后 base64 | 见下方解码示例 |
+| `additional_metadata` | 事件特有字段 | 调用方 metadata 过滤后 JSON/base64 | 见下方 `tengu_api_success` 解码示例 |
+| `auth.account_uuid` | Anthropic 账户 UUID | OAuth/account profile | 当前未上报 |
+| `auth.organization_uuid` | Anthropic 组织 UUID | OAuth/account profile | 当前未上报 |
+| `email` | 邮箱 | 账户上下文 | 当前未上报 |
+| `agent_id` | 子 agent ID | agent async context | 当前代表事件未上报 |
+| `parent_session_id` | 父会话 ID | agent async context | 当前代表事件未上报 |
+| `agent_type` | `standalone`/`teammate` 等 | agent 状态 | 当前代表事件未上报 |
+| `team_name` | agent team 名 | team 状态 | 当前代表事件未上报 |
+| `skill_name` | skill 名 | `_PROTO_skill_name` 特殊提升 | 仅相关事件出现 |
+| `plugin_name` | plugin 名 | `_PROTO_plugin_name` 特殊提升 | 仅相关事件出现 |
+| `marketplace_name` | marketplace 名 | `_PROTO_marketplace_name` 特殊提升 | 仅相关事件出现 |
+| `repl_code` | REPL 相关 code | `_PROTO_code` 特殊提升 | 仅相关事件出现 |
+| `head_sha` | Git HEAD SHA/派生值 | Git 上下文 | 当前代表事件未上报 |
+| `swe_bench_run_id` | SWE-bench run | 环境变量 | 当前为空 |
+| `swe_bench_instance_id` | SWE-bench instance | 环境变量 | 当前为空 |
+| `swe_bench_task_id` | SWE-bench task | 环境变量 | 当前为空 |
+
+### 1.5 `env` 字段表
+
+| Key | 含义/来源 | 当前真实值 |
+|---|---|---|
+| `platform`, `platform_raw` | 标准化/原始平台 | `darwin`, `darwin` |
+| `arch` | CPU 架构 | `arm64` |
+| `node_version` | 暴露给应用的 Node/Bun 兼容版本 | `v26.3.0` |
+| `terminal` | 终端类型 | `dumb` |
+| `shell` | shell 探测 | `zsh` |
+| `package_managers` | PATH/环境中可用的包管理器 | `npm,yarn,pnpm` |
+| `runtimes` | 可用运行时 | `node` |
+| `is_running_with_bun` | Bun runtime 检测 | `true` |
+| `is_ci` | CI 环境检测 | `false` |
+| `is_claubbit` | 内部运行环境检测 | `false` |
+| `is_github_action` | `GITHUB_ACTIONS` 等环境检测 | `false` |
+| `is_claude_code_action` | Claude Code Action 环境检测 | `false` |
+| `is_claude_ai_auth` | Claude.ai OAuth auth 判定 | `false` |
+| `is_claude_code_remote` | Remote 环境 | `false` |
+| `is_local_agent_mode` | local-agent entrypoint | `false` |
+| `is_conductor` | Conductor 环境 | `false` |
+| `version`, `version_base` | Claude Code 版本 | `2.1.204` |
+| `build_time` | 构建时间 | `2026-07-07T23:19:03Z` |
+| `deployment_environment` | 部署环境 | `unknown-darwin` |
+| `vcs` | VCS 类型；按上下文可选 | `git`（在 datalog 样本中出现） |
+| `github_event_name` 等 | GitHub Actions metadata | 当前未上报 |
+| `wsl_version` | WSL 检测 | 当前未上报 |
+| `linux_distro_id/version/kernel` | Linux 系统信息 | macOS 下未上报 |
+| `remote_environment_type/container_id/remote_session_id` | Claude Remote 信息 | 当前未上报 |
+| `tags` | `CLAUDE_CODE_TAGS` | 当前未上报 |
+
+### 1.6 真实 `process` 解码值
+
+```json
+{
+  "uptime": 5.099096959000001,
+  "rss": 368492544,
+  "heapTotal": 65640448,
+  "heapUsed": 46579832,
+  "external": 20710824,
+  "arrayBuffers": 1684363,
+  "constrainedMemory": 17179869184,
+  "cpuUsage": {
+    "user": 496509,
+    "system": 100479
+  }
+}
+```
+
+### 1.7 真实 `tengu_api_success.additional_metadata` 解码值
+
+```json
+{
+  "model": "deepseek-v4-pro",
+  "messageCount": 2,
+  "messageTokens": 0,
+  "inputTokens": 38850,
+  "outputTokens": 30,
+  "cachedInputTokens": 0,
+  "uncachedInputTokens": 0,
+  "durationMs": 4519,
+  "durationMsIncludingRetries": 4522,
+  "attempt": 1,
+  "ttftMs": 459,
+  "buildAgeMins": 9013,
+  "provider": "firstParty",
+  "stop_reason": "end_turn",
+  "costUSD": 0.195,
+  "didFallBackToNonStreaming": false,
+  "isNonInteractiveSession": true,
+  "print": true,
+  "isTTY": false,
+  "querySource": "sdk",
+  "queryChainId": "290fba25-7a97-47b7-9b81-bd7d95a9b951",
+  "queryDepth": 0,
+  "permissionMode": "default",
+  "globalCacheStrategy": "none",
+  "textContentLength": 14,
+  "thinkingContentLength": 92,
+  "imageBlockCount": 0,
+  "imageTotalPixels": 0,
+  "imageTotalBytes": 0,
+  "documentBlockCount": 0,
+  "documentTotalBytes": 0,
+  "inputTextCharLength": 7735,
+  "estimatedInputTokens": 2578,
+  "fastMode": false,
+  "baseUrl": "efdbb18afca7",
+  "envModel": "deepseek-v4-pro",
+  "timeSinceLastApiCallMs": 2745
+}
+```
+
+这里没有直接上传 prompt 文本，但上传了输入字符数、估算 token、thinking/text 长度、模型、成本、耗时、TTFT、query chain 和 base URL 哈希。其他事件类型可能携带不同 metadata。
+
+### 1.8 真实发送结果
+
+`claude-code-2.1.204-telemetry-enabled/claude.har` 中观察到：
+
+- 11 个 1P batch。
+- 请求体大小约 3.2 KiB 到 142 KiB。
+- 11 个请求全部 HTTP 200。
+- 服务端响应累计 `accepted_count = 240`，`rejected_count = 0`。
+
+真实响应示例：
+
+```json
+{
+  "accepted_count": 76,
+  "rejected_count": 0
+}
+```
+
+---
+
+## 2. Datadog datalog
+
+### 2.1 触发条件 
+
+一个事件进入 Datadog 必须同时满足：
+
+1. `tengu_log_datadog_events === true`；本机真实缓存值为 `true`。
+2. `tengu_frond_boric.datadog !== true`，即没有触发 killswitch。
+3. `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`、`DISABLE_TELEMETRY` 均未设置，且 `DO_NOT_TRACK` 未解析为 truthy。
+4. `CLAUDE_CODE_ENVIRONMENT_KIND !== "byoc"`；如果等于 `byoc`，还必须显式启用 `CLAUDE_CODE_BYOC_ENABLE_DATADOG`。
+5. `getAPIProvider() === "firstParty"`。
+6. 事件名位于硬编码 Datadog allowlist。
+7. 如果有 `model`，其小写形式必须包含 `claude`。
+
+本机原始模型为 `deepseek-v4-pro`，因此之前在第 7 步返回。测试 hook 只把 Claude Code 解析到的模型改为 `claude-haiku-4-5`，没有修改 provider 函数或上述开关。
+
+### 2.2 端点与发送行为
+
+```text
+POST https://http-intake.logs.us5.datadoghq.com/api/v2/logs
+```
+
+真实请求头：
+
+| Header | 生成方式 | 当前真实值/说明 |
+|---|---|---|
+| `Content-Type` | 固定常量 | `application/json`；body 是日志对象数组 |
+| `DD-API-KEY` | Claude Code 2.1.204 二进制内置的公开 Datadog client token | `pubea5604404508cdd34afb69e6f42a05bc`；不是用户的 DeepSeek/Anthropic token |
+| `User-Agent` | Axios 默认 `User-Agent` | `axios/1.15.2` |
+| `Accept-Encoding` | Axios/Bun HTTP 栈默认压缩能力声明 | `gzip, compress, deflate, br` |
+
+默认行为：
+
+- 最多积累 100 条后立即 flush。
+- 默认 flush 间隔 15 秒，可由 `CLAUDE_CODE_DATADOG_FLUSH_INTERVAL_MS` 改写；本次 hook 测试设为 1 秒。
+- HTTP timeout 为 5 秒。
+- 发送前先从内存数组移除；失败时只写 debug/error 日志，没有看到类似 1P 的磁盘失败队列。
+
+### 2.3 数据转换与归一化
+
+- `toolName` 以 `mcp__` 开头时统一变成 `mcp`。
+- `status` 转换成 `http_status` 和 `http_status_range`，随后删除原 `status`。
+- 模型名归一化到 Claude 模型族；无法识别时为 `other`。
+- dev 版本号去除时间/SHA 后缀。
+- JavaScript camelCase metadata 转成 snake_case。
+- 常用维度再拼成 `ddtags`，便于 Datadog facet/tag 查询。
+
+### 2.4 字段表
+
+| Key | 含义/采集方式 | 本次真实值/示例 |
+|---|---|---|
+| `ddsource` | 固定 source | `nodejs` |
+| `service` | 固定服务名 | `claude-code` |
+| `hostname` | 固定逻辑主机名，不是本机 hostname | `claude-code` |
+| `env` | 固定部署标签 | `external` |
+| `message` | 事件名 | `tengu_bash_tool_command_executed` |
+| `ddtags` | 事件与常用维度拼接 | `event:tengu_bash_tool_command_executed,arch:arm64,...` |
+| `model` | 当前模型；经过 Claude 模型归一化 | `claude-haiku-4-5` |
+| `session_id` | 会话 UUID | `c48ed5af-3a6d-4e29-9278-7078aa29f703` |
+| `user_type` | 用户类型 | `external` |
+| `betas` | beta 列表 | `interleaved-thinking-2025-05-14,...` |
+| `entrypoint` | 运行入口 | `sdk-cli` |
+| `is_interactive` | 是否交互 UI；该字段在实际记录中为字符串 | `"false"` |
+| `client_type` | 客户端类型 | `sdk-cli` |
+| `process_metrics` | 内存、CPU、uptime | 见下方真实记录 |
+| `user_bucket` | 稳定分桶/采样维度 | `11` |
+| `rh` | repo/context 派生的短哈希；精确语义未完全命名恢复 | `0bd1a390eda6796d` |
+| `platform`, `platform_raw` | 平台 | `darwin`, `darwin` |
+| `arch` | 架构 | `arm64` |
+| `node_version` | runtime 兼容版本 | `v26.3.0` |
+| `terminal`, `shell` | 终端和 shell | `dumb`, `zsh` |
+| `package_managers` | 可用包管理器 | `npm,yarn,pnpm` |
+| `runtimes` | 可用运行时 | `node` |
+| `is_running_with_bun` | Bun 检测 | `true` |
+| `version`, `version_base` | Claude Code 版本 | `2.1.204` |
+| `build_time` | 构建时间 | `2026-07-07T23:19:03Z` |
+| `deployment_environment` | 部署环境 | `unknown-darwin` |
+| `vcs` | VCS | `git` |
+| `account_uuid`, `organization_uuid` | 账户/组织身份；存在时加入 | 当前记录未出现 |
+| `swe_bench_*` | SWE-bench 环境变量 | 当前为空字符串 |
+| 事件专用字段 | 调用方 metadata 扁平化 | 例如 bash 的 `exit_code`、`stdout_length`、sandbox/permission 字段 |
+
+### 2.5 真实 `tengu_bash_tool_command_executed` 记录
+
+```json
+{
+  "ddsource": "nodejs",
+  "ddtags": "event:tengu_bash_tool_command_executed,arch:arm64,client_type:sdk-cli,entrypoint:sdk-cli,model:claude-haiku-4-5,platform:darwin,user_bucket:11,user_type:external,version:2.1.204,version_base:2.1.204",
+  "message": "tengu_bash_tool_command_executed",
+  "service": "claude-code",
+  "hostname": "claude-code",
+  "env": "external",
+  "model": "claude-haiku-4-5",
+  "session_id": "c48ed5af-3a6d-4e29-9278-7078aa29f703",
+  "user_type": "external",
+  "entrypoint": "sdk-cli",
+  "is_interactive": "false",
+  "client_type": "sdk-cli",
+  "process_metrics": {
+    "uptime": 7.229933957999999,
+    "rss": 330727424,
+    "heapTotal": 50850816,
+    "heapUsed": 83940077,
+    "external": 40676547,
+    "arrayBuffers": 2238452,
+    "constrainedMemory": 17179869184,
+    "cpuUsage": {"user": 1028405, "system": 156739},
+    "cpuPercent": 36.987500000000004,
+    "cpuWindowMs": 16
+  },
+  "rh": "0bd1a390eda6796d",
+  "platform": "darwin",
+  "platform_raw": "darwin",
+  "arch": "arm64",
+  "node_version": "v26.3.0",
+  "terminal": "dumb",
+  "shell": "zsh",
+  "package_managers": "npm,yarn,pnpm",
+  "runtimes": "node",
+  "is_running_with_bun": true,
+  "is_ci": false,
+  "is_claude_code_remote": false,
+  "version": "2.1.204",
+  "build_time": "2026-07-07T23:19:03Z",
+  "deployment_environment": "unknown-darwin",
+  "vcs": "git",
+  "command_type": "other",
+  "stdout_length": 40,
+  "stderr_length": 0,
+  "exit_code": 0,
+  "interrupted": false,
+  "executor_shell": "zsh",
+  "executor_shell_overridden": false,
+  "sandboxed": false,
+  "sandbox_enabled": false,
+  "dangerously_disable_sandbox": false,
+  "filesystem_policy": "strict",
+  "destructive_category": "none",
+  "destructive_target_scope": "none",
+  "git_destructive_target": "none",
+  "permission_mode": "default",
+  "user_bucket": 11
+}
+```
+
+该记录没有上传实际命令文本或 stdout 内容，只上传命令类型、输出长度、退出码、shell、sandbox、破坏性分类和权限模式。其他 allowlist 事件具有各自的事件字段。
+
+### 2.6 本次真实事件与发送结果
+
+三轮 hook 交互共 96 条 Datadog 事件：
+
+| 事件名 | 数量 |
+|---|---:|
+| `tengu_feature_ok` | 71 |
+| `tengu_timer` | 6 |
+| `tengu_sdk_ttft` | 3 |
+| `tengu_sdk_result` | 3 |
+| `tengu_init` | 3 |
+| `tengu_headless_mcp_prewait` | 3 |
+| `tengu_feature_bad` | 3 |
+| `tengu_tool_use_success` | 2 |
+| `tengu_session_file_read` | 1 |
+| `tengu_bash_tool_command_executed` | 1 |
+
+发送结果：
+
+- 10 个 HTTP batch。
+- 请求体总计 151,511 bytes。
+- 7 个响应被 hook 捕获为 HTTP 202，响应 body 为 `{}`。
+- 3 个最终 flush 在短生命周期 CLI 退出前没有记录到响应；这不等价于服务端拒收。
+- 没有捕获到 network hook 的 `error` 事件。
+
+---
+
+## 3. GrowthBook
+
+GrowthBook 链应拆成两个方向：
+
+1. Claude Code 向 GrowthBook remote-eval 获取 feature/experiment 分配。
+2. 真正发生实验曝光后，Claude Code 把曝光转换成 `GrowthbookExperimentEvent`，并入 1P Event Logging。
+
+### 3.1 开关、初始化门控与 Remote-eval 端点
+
+GrowthBook 的总启用判断是 `isGrowthBookEnabled()`，2.1.204 中等价于：
+
+```js
+isGrowthBookEnabled =
+  !DISABLE_GROWTHBOOK &&
+  is1PEventLoggingEnabled();
+```
+
+因此它受以下英文原名开关/状态控制：
+
+| 原始名称/条件 | 允许初始化的条件 | 作用 |
+|---|---|---|
+| `DISABLE_GROWTHBOOK` | 未设置 | GrowthBook 专用 disable switch |
+| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | 未设置 | 通过 `is1PEventLoggingEnabled()` 间接关闭 GrowthBook |
+| `DISABLE_TELEMETRY` | 未设置 | 通过 `is1PEventLoggingEnabled()` 间接关闭 GrowthBook |
+| `DO_NOT_TRACK` | 未解析为 truthy | 通过 `is1PEventLoggingEnabled()` 间接关闭 GrowthBook |
+| `getAPIProvider() === "firstParty"` | 为真，或 `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` 为 truthy | 复用 1P provider gate |
+| runtime `gatewayAuth` / `CLAUDE_CODE_USE_GATEWAY` | 没有进入 Gateway auth 状态 | 复用 1P Gateway gate |
+| 官方 `Authorization` / `x-api-key` header resolution | 成功 | 实际调用 SDK `init()`、发送 `/api/eval` 并按响应能力建立 `/sub` |
+
+Claude Code 创建 GrowthBook SDK 时使用：
+
+```js
+new GrowthBook({
+  apiHost: "https://api.anthropic.com/",
+  clientKey: "sdk-zAZezfDKGoZuXXKe",
+  remoteEval: true,
+  cacheKeyAttributes: ["id", "organizationUUID"],
+  attributes: getUserAttributes()
+});
+```
+
+因此配置请求为：
+
+```text
+POST https://api.anthropic.com/api/eval/sdk-zAZezfDKGoZuXXKe
+```
+
+SDK 通用的非 remote-eval 路径为 `/api/features/<clientKey>`，但 Claude Code 当前设置 `remoteEval: true`，所以正常不会使用该路径。
+
+当 response header 包含 `x-sse-support: enabled` 时，会建立后台 EventSource：
+
+```text
+GET https://api.anthropic.com/sub/sdk-zAZezfDKGoZuXXKe
+```
+
+SSE 事件：
+
+| Event | 行为 |
+|---|---|
+| `features` | 直接解析事件 data，更新当前 feature payload 和缓存 |
+| `features-updated` | 重新调用 `/api/eval/<clientKey>` |
+
+SDK refresh 周期与缓存相关参数：
+
+| 参数 | 值 |
+|---|---:|
+| SDK `maxAge` | 14,400,000 ms（4 小时） |
+| SDK `staleTTL` | 60,000 ms |
+| SDK `maxEntries` | 10 |
+| Claude Code periodic refresh | 21,600,000 ms（6 小时） |
+
+### 3.2 `/api/eval` 请求字段
+
+```json
+{
+  "attributes": {},
+  "forcedVariations": {},
+  "forcedFeatures": [],
+  "url": ""
+}
+```
+
+| Key | 含义 | 采集方式 |
+|---|---|---|
+| `attributes.id` | GrowthBook 分桶主 ID | Claude Code `device_id` |
+| `attributes.deviceID` | 同一 device ID 的兼容字段 | Claude Code `device_id` |
+| `attributes.sessionId` | 当前会话 UUID | session state |
+| `attributes.platform` | 平台 | `darwin` 等 |
+| `attributes.apiBaseUrlHost` | 仅自定义 API host 时加入 | `new URL(ANTHROPIC_BASE_URL).host` |
+| `attributes.organizationUUID` | 组织 UUID | OAuth/account 或环境变量 |
+| `attributes.accountUUID` | 账户 UUID | OAuth/account 或环境变量 |
+| `attributes.userType` | 用户类型 | 当前固定/解析为 `external` |
+| `attributes.subscriptionType` | 订阅类型 | OAuth/account cache |
+| `attributes.rateLimitTier` | 限流 tier | OAuth/account cache |
+| `attributes.firstTokenTime` | 首次使用时间 | `claudeCodeFirstTokenDate` |
+| `attributes.email` | 账户邮箱 | profile context |
+| `attributes.appVersion` | Claude Code 版本 | build constant |
+| `attributes.githubActionsMetadata` | GitHub Actions 身份/仓库字段 | `GITHUB_*` 环境变量 |
+| `attributes.releaseChannel` | 更新通道 | `autoUpdatesChannel` |
+| `attributes.entrypoint` | 入口 | `CLAUDE_CODE_ENTRYPOINT` |
+| `attributes.hasUsedRemoteSession` | 是否用过 remote session | 本地状态 |
+| `forcedVariations` | 本地强制实验 variation | GrowthBook runtime overrides |
+| `forcedFeatures` | 本地强制 feature map 转数组 | GrowthBook runtime overrides |
+| `url` | SDK 上下文 URL | CLI 场景通常为空字符串 |
+
+### 3.3 当前状态下计算出的真实属性值
+
+以下值来自与 datalog 样本相同的 PID 98380 会话状态。它们是代码会用于 remote-eval body 的真实当前值，但本轮没有成功形成线上 `/api/eval` 请求：
+
+```json
+{
+  "attributes": {
+    "id": "3a232b1a1d788667a15e0720564540eb32345f739c5a36ec20f91587c1f6d93d",
+    "sessionId": "c48ed5af-3a6d-4e29-9278-7078aa29f703",
+    "deviceID": "3a232b1a1d788667a15e0720564540eb32345f739c5a36ec20f91587c1f6d93d",
+    "platform": "darwin",
+    "apiBaseUrlHost": "api.deepseek.com",
+    "userType": "external",
+    "appVersion": "2.1.204",
+    "entrypoint": "sdk-cli"
+  },
+  "forcedVariations": {},
+  "forcedFeatures": [],
+  "url": ""
+}
+```
+
+当前没有 `organizationUUID`、`accountUUID`、`subscriptionType`、`rateLimitTier`、`firstTokenTime`、`email`、`releaseChannel` 或 `hasUsedRemoteSession`，因此这些 key 会省略，而不是发送 `null`。
+
+### 3.4 为什么这轮没有 `/api/eval` 和 `/sub`
+
+Claude Code 只有在官方 auth header 解析成功后才执行 GrowthBook SDK `init()` 网络请求。当前 DeepSeek token/base URL 场景下，GrowthBook 初始化没有得到可用的官方 `Authorization`/`x-api-key` headers，于是：
+
+- 不调用 `/api/eval/<clientKey>`。
+- 不建立 `/sub/<clientKey>` SSE。
+- 继续使用 `~/.claude.json` 中的 `cachedGrowthBookFeatures`。
+
+这与抓包一致：两份 HAR 和当前 JSONL 都没有 `eval`、`sub` 或 `features` 请求。
+
+### 3.5 本机当前实际应用的 feature 值
+
+这些值来自 `~/.claude.json.cachedGrowthBookFeatures`，是当前真实生效值：
+
+| Feature key | 当前值 | 可确认用途 |
+|---|---|---|
+| `tengu_1p_event_batch_config` | `{"scheduledDelayMillis":5000,"maxExportBatchSize":200,"maxQueueSize":8192}` | 1P batch 延迟、批大小、队列大小 |
+| `tengu_brass_pebble` | `false` | 内部 feature；当前静态命名不足以可靠恢复业务名 |
+| `tengu_disable_bypass_permissions_mode` | `false` | `bypass permissions mode` disable flag |
+| `tengu_event_sampling_config` | `{}` | 按事件名配置 1P/Datadog 采样率 |
+| `tengu_keybinding_customization_release` | `true` | keybinding customization release gate |
+| `tengu_log_datadog_events` | `true` | Datadog datalog enable flag |
+| `tengu_log_segment_events` | `false` | Segment event logging flag；当前三链分析未把 Segment 计入独立链 |
+| `tengu_marble_anvil` | `true` | 内部 feature；业务语义未可靠恢复 |
+| `tengu_mcp_tool_search` | `false` | MCP tool search gate |
+| `tengu_scarf_coffee` | `false` | 内部 feature；业务语义未可靠恢复 |
+| `tengu_scratch` | `false` | 内部 feature；业务语义未可靠恢复 |
+| `tengu_thinkback` | `false` | thinkback gate |
+| `tengu_tool_pear` | `false` | 内部 tool feature gate |
+
+当前：
+
+```text
+cached feature count = 13
+cachedExperimentFeatures = null
+```
+
+### 3.6 GrowthBook 实验曝光如何上报
+
+当 remote payload 将某个 feature 标记为 experiment，且实际发生 variation 分配时，Claude Code 调用 `logGrowthBookExperimentTo1P`，生成：
+
+```json
+{
+  "event_type": "GrowthbookExperimentEvent",
+  "event_data": {
+    "event_id": "<UUID>",
+    "timestamp": "<ISO time>",
+    "experiment_id": "<experiment key>",
+    "variation_id": "<variation id>",
+    "environment": "production",
+    "device_id": "<persistent device id>",
+    "session_id": "<session UUID>",
+    "user_attributes": "{\"appVersion\":\"2.1.204\"}",
+    "experiment_metadata": "{\"feature_id\":\"<feature key>\"}",
+    "auth": {
+      "account_uuid": "<optional>",
+      "organization_uuid": "<optional>"
+    }
+  }
+}
+```
+
+这里的 `user_attributes` 和 `experiment_metadata` 是 JSON 字符串，不是嵌套对象。
+
+当前所有 JSONL/HAR 中没有观察到 `GrowthbookExperimentEvent`，本机的 `cachedExperimentFeatures` 也为 `null`，所以没有可以诚实填写的“本轮真实曝光值”。不能把上面的结构模板误写成已经上报成功的网络事实。
+
+---
+
+## 4. 三条链的字段重叠与差异
+
+| 数据 | 1P Event | Datadog | GrowthBook eval | GrowthBook exposure |
+|---|---:|---:|---:|---:|
+| 持久 `device_id` | 是 | 当前记录没有 | 是，作为 `id` 和 `deviceID` | 是 |
+| session UUID | 是 | 是 | 是 | 是 |
+| account/org UUID | 可选 | 可选 | 可选 | 可选 |
+| model | 是 | 是，且会归一化 | eval body 默认不含 model | 默认不含 model |
+| 自定义 API host | 以 12 位 `baseUrl` 哈希出现在部分事件 | 取决于事件 metadata | 明文 host：`api.deepseek.com` | 默认不含 |
+| OS/arch/runtime | 详细 env 对象 | 详细扁平字段 | 主要是 `platform` | 默认不含 |
+| process CPU/RSS/heap | `process` base64 JSON | `process_metrics` 对象 | 否 | 否 |
+| 工具结果/权限分类 | 按事件 metadata | allowlist 事件中扁平化 | 否 | 否 |
+| feature key/value | 部分 feature/实验事件 | `tengu_feature_*` 可带 `feature_name` | response 返回全部分配值 | `experiment_metadata.feature_id` |
+| prompt 原文 | 本次样本未见 | 本次样本未见 | 否 | 否 |
+| 输入长度/token/成本 | API 事件中有 | 相应 allowlist API 事件可有 | 否 | 否 |
+
+## 5. 证据文件
+
+### JSONL
+
+- `network-traces/claude-network-1784007150219-50414.jsonl`：未修改模型名时的真实 1P `tengu_api_success`。
+- `captures/official-datalog-20260714-152922/claude-network-1784014538080-98380.jsonl`：启用 datalog hook 后的 Bash/tool/Datadog 记录。
+
+### HAR
+
+- `mitm-captures/claude-code-2.1.204-telemetry-enabled/claude.har`：11 次成功的 1P batch、240 个 accepted events。
+- `mitm-captures/claude-code-2.1.204/claude.har`：未启用额外遥测测试时的模型请求基线。
+
+### 本地缓存
+
+- `~/.claude.json.cachedGrowthBookFeatures`：当前 13 个 feature 的真实本地生效值。
+
+## 6. 最终判断
+
+1. **1P Event Logging 是最完整的产品事件主链**：事件数量多、字段丰富、支持 batch/retry/失败落盘；GrowthBook 曝光也复用它。
+2. **Datadog 是 1P 事件流的受限子集/旁路 sink**：受 feature flag、provider、事件 allowlist 和 Claude 模型名共同限制，字段被扁平化以便日志检索。
+3. **GrowthBook 的独立网络职责是配置与分流，不是主要日志上传**：`eval/sub` 用于 feature payload；曝光记录最终仍进入 1P endpoint。
+4. 当前 DeepSeek-compatible 配置被内部 provider 枚举称为 `firstParty`，但并非真正的 Anthropic first-party API backend；GrowthBook 正因为缺少可用官方 auth headers 而只使用磁盘缓存。
