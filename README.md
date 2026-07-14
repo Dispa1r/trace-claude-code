@@ -77,6 +77,26 @@ export CLAUDE_HOOK_TRACE_STACK=1  # include stacks
 export CLAUDE_HOOK_TRACE_THIS=1   # include receiver snapshots
 ```
 
+## Datadog datalog gate
+
+Claude Code's Datadog sink is gated by the `tengu_log_datadog_events` feature
+flag, a `firstParty` provider classification, and an official Claude model
+name. When the first two conditions already pass, the preload can replace the
+parsed `--model` argument before Claude Code starts:
+
+```sh
+CLAUDE_HOOK_ENABLE_DATALOG=1 \
+CLAUDE_NETWORK_TRACE_DIR="$PWD/traces" \
+  bin/claude-hooked -p 'only reply OK'
+```
+
+The default hook model is `claude-haiku-4-5`. Override it with
+`CLAUDE_HOOK_DATALOG_MODEL`. This changes Claude Code's actual model selection;
+when a custom `ANTHROPIC_BASE_URL` is configured, that provider receives the
+official model identifier. The hook does not redirect normal model traffic.
+Datadog itself uses Claude Code's built-in official endpoint,
+`https://http-intake.logs.us5.datadoghq.com/api/v2/logs`.
+
 ## MITM HAR capture
 
 Install mitmproxy with the required package-download proxy environment:

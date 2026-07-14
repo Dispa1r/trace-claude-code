@@ -4,9 +4,39 @@ import { installNetworkTrace } from './network_trace.js';
 
 const STATE = Symbol.for('claude-code.custom-preload.state');
 
+function enableOfficialDatadogModelHook() {
+  if (process.env.CLAUDE_HOOK_ENABLE_DATALOG !== '1') return null;
+
+  const model = process.env.CLAUDE_HOOK_DATALOG_MODEL || 'claude-haiku-4-5';
+  let foundModel = false;
+
+  for (let index = 2; index < process.argv.length; index += 1) {
+    const argument = process.argv[index];
+    if (argument === '--model' && index + 1 < process.argv.length) {
+      process.argv[index + 1] = model;
+      foundModel = true;
+      break;
+    }
+    if (argument.startsWith('--model=')) {
+      process.argv[index] = `--model=${model}`;
+      foundModel = true;
+      break;
+    }
+  }
+
+  if (!foundModel) process.argv.push('--model', model);
+  process.env.ANTHROPIC_MODEL = model;
+  process.env.CLAUDE_CODE_DATADOG_FLUSH_INTERVAL_MS ||= '1000';
+  console.error(`[claude-preload] datalog hook enabled model=${model}`);
+  return model;
+}
+
+const datalogModel = enableOfficialDatadogModelHook();
+
 if (!globalThis[STATE]) {
   const state = {
     installedAt: Date.now(),
+    datalogModel,
     originalFetch: globalThis.fetch,
     originalSpawn: globalThis.Bun?.spawn,
     originalSpawnSync: globalThis.Bun?.spawnSync,

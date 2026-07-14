@@ -16,13 +16,15 @@ function now() {
 }
 
 function sensitiveHeader(name) {
-  return /^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|x-auth-token)$/i.test(String(name));
+  const normalized = String(name);
+  return /^(authorization|proxy-authorization|cookie|set-cookie|x-auth-token)$/i.test(normalized)
+    || /(^|[-_])api[-_]?key$/i.test(normalized);
 }
 
 function redactText(text, enabled) {
   if (!enabled || typeof text !== 'string') return text;
   return text
-    .replace(/(^|\r?\n)(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|x-auth-token)\s*:[^\r\n]*/gi, '$1$2: <redacted>')
+    .replace(/(^|\r?\n)(authorization|proxy-authorization|cookie|set-cookie|x-auth-token|[a-z0-9_-]*api[-_]?key)\s*:[^\r\n]*/gi, '$1$2: <redacted>')
     .replace(/(["'](?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)["']\s*:\s*["'])[^"']*/gi, '$1<redacted>');
 }
 
