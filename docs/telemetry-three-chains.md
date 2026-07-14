@@ -137,13 +137,226 @@ printf '%s' 'https://api.deepseek.com/anthropic' | shasum -a 256 | cut -c1-12
 
 ### 模型请求中的 attribution payload 与其他常见 request header 生成方式
 
-`x-anthropic-billing-header` 在 2.1.204 里容易看错：对 DeepSeek-compatible `/v1/messages` 请求，Bun preload JSONL 看到的是 `system[0].text` 里的 attribution 文本，不一定是最终 wire body。当前这份 capture 目录里的普通 JSONL 只能看到：
+`x-anthropic-billing-header` 在 2.1.204 里容易看错：它不是 HTTP header，而是模型请求 JSON body 里 `system[0].text` 的一行 attribution 文本。这里还要分清两层：
+
+- 上层 JavaScript request builder 有时只会生成 `cc_version` / `cc_entrypoint`
+- 在另一条分支上，上层 JavaScript request builder 会先放入 `cch=00000`
+- 最终真实的 5 位 `cch` 值始终不是 JavaScript 算出来的，而是 native body-prepare 阶段原地覆写
+
+因此，普通 preload / JSONL：
+
+- 有时只能看到：
 
 ```text
 x-anthropic-billing-header: cc_version=2.1.204.<fp>; cc_entrypoint=sdk-cli;
 ```
 
-而受控 Frida/native probe 证明：`cch` 不是在 JavaScript `fetch` 层生成，而是在 native body prepare 阶段才补进最终 body，所以普通 preload 抓不到并不代表它不存在。
+- 有时会直接看到：
+
+```text
+x-anthropic-billing-header: cc_version=2.1.204.<fp>; cc_entrypoint=sdk-cli; cch=00000;
+```
+
+受控 Frida/native probe 证明：不论 placeholder 是否已经在 JavaScript 层出现，最终真实 `cch` 都是在 native body prepare 阶段才改写成 5 位 hex；所以普通 preload 看不到 placeholder，不代表最终 wire body 没有 `cch`；而 preload 即使看到了 `cch=00000`，也不代表最终值是 JavaScript 生成的。
+
+#### `cch=00000` 什么时候会被上层 request builder 放进 body
+
+2.1.204 里 attribution builder 的核心逻辑可以还原为：
+
+```js
+function AIn(fp3, agentContext, prevReqId) {
+  if (CLAUDE_CODE_ATTRIBUTION_HEADER is disabled) return "";
+
+  const provider = wn();
+  const addCchPlaceholder =
+    (provider === "firstParty" && dd()) ||
+    provider === "vertex";
+
+  // ...
+}
+```
+
+其中 `wn()` 只是 provider 分类器：
+
+```js
+function wn() {
+  if (gatewayAuth) return "gateway";
+  if (CLAUDE_CODE_USE_BEDROCK) return "bedrock";
+  if (CLAUDE_CODE_USE_FOUNDRY) return "foundry";
+  if (CLAUDE_CODE_USE_ANTHROPIC_AWS) return "anthropicAws";
+  if (CLAUDE_CODE_USE_MANTLE) return "mantle";
+  if (CLAUDE_CODE_USE_VERTEX) return "vertex";
+  return "firstParty";
+}
+```
+
+所以 `provider === "firstParty"` 本身并不够，它只说明“当前没有落到 Bedrock / Vertex / Foundry / Mantle / Gateway 这些分支”，未必代表模型请求真的还在打官方 Anthropic base URL。
+
+真正负责 second gate 的是 `dd()`：
+
+```js
+function dd() {
+  if (_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL) return true;
+  return kxn();
+}
+
+function kxn() {
+  const baseUrl = process.env.ANTHROPIC_BASE_URL;
+  if (!baseUrl) return true;
+  return dke(baseUrl);
+}
+
+function dke(baseUrl) {
+  try {
+    return ["api.anthropic.com"].includes(new URL(baseUrl).host);
+  } catch {
+    return false;
+  }
+}
+```
+
+这意味着：
+
+- 未设置 `ANTHROPIC_BASE_URL`：`dd() === true`
+- `ANTHROPIC_BASE_URL` 的 `host` 精确等于 `api.anthropic.com`：`dd() === true`
+- 自定义 DeepSeek-compatible base URL、本地 loopback、任意自建 gateway：`dd() === false`
+- 内部 override `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` 可强制 `dd() === true`
+
+按代码字面，它比较的是 `new URL(...).host`，不是 `hostname`；因此显式端口也会影响比较结果，例如 `api.anthropic.com:443` 也会被视为不同 host。
+
+所以，上层 builder 会把 `cch=00000` 放进 body 的条件可以精确写成：
+
+- `wn() === "vertex"`；或
+- `wn() === "firstParty"` 且 `dd() === true`
+
+反过来说：
+
+- 只要 `ANTHROPIC_BASE_URL` 已经切到 `https://api.deepseek.com/anthropic`
+- 且没有 `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` 这种内部 override
+
+那么默认 JavaScript builder 就不会先放入 `cch=00000`。
+
+#### `zy()` / `gatewayAuth`：为什么自定义 `ANTHROPIC_BASE_URL` 不会自动变成 `"gateway"`
+
+`wn()` 的第一分支不是“只要设置了自定义 `ANTHROPIC_BASE_URL` 就算 gateway”，而是：
+
+```js
+function zy() {
+  return Ht.gatewayAuth;
+}
+
+function wn() {
+  if (zy()) return "gateway";
+  if (CLAUDE_CODE_USE_BEDROCK) return "bedrock";
+  if (CLAUDE_CODE_USE_FOUNDRY) return "foundry";
+  if (CLAUDE_CODE_USE_ANTHROPIC_AWS) return "anthropicAws";
+  if (CLAUDE_CODE_USE_MANTLE) return "mantle";
+  if (CLAUDE_CODE_USE_VERTEX) return "vertex";
+  return "firstParty";
+}
+```
+
+也就是说，是否进入 `"gateway"` provider，不取决于你有没有改 `ANTHROPIC_BASE_URL`，而取决于进程内状态 `Ht.gatewayAuth` 是否已经被填上。
+
+这个状态的最小结构可以从 restore / bootstrap 逻辑直接看到：
+
+```js
+J2e({
+  url: gatewayUrl,
+  jwt: gatewayJwt,
+  expiresAt: <timestamp ms>,
+  unpinned: true | false
+})
+```
+
+当前可直接确认的字段语义：
+
+- `url`：gateway base URL
+- `jwt`：gateway bearer token
+- `expiresAt`：过期时间；`g5o()` 用它判断是否过期
+- `unpinned`：是否未做 TLS pin；`Dft(e)` 用 `!e.unpinned` 判断“是否 pinned”
+
+相关 helper：
+
+```js
+function zy() {
+  return Ht.gatewayAuth;
+}
+
+function g5o() {
+  const e = Ht.gatewayAuth;
+  return !!e && e.expiresAt <= Date.now();
+}
+
+function Dft(e) {
+  return !!e && !e.unpinned;
+}
+
+function J2e(e) {
+  Ht.gatewayAuth = e;
+}
+```
+
+`gatewayAuth` 的来源在 2.1.204 里主要有两类：
+
+1. 显式 gateway 模式：
+
+```js
+if (CLAUDE_CODE_USE_GATEWAY) {
+  // read ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN
+  J2e({ url, jwt, expiresAt, unpinned: true })
+}
+```
+
+这种模式只是把环境变量里的 gateway URL / token 装进 `gatewayAuth`，并显式标成 `unpinned: true`。
+
+2. 恢复已保存的 enterprise gateway 会话：
+
+- 从本地持久化状态读取 `enterpriseGateway`
+- 按 hostname 查本机保存的 `gatewayTrust`
+- 若存在 pin，则尝试做 TLS fingerprint probe
+- 验证通过后 `J2e(t)`
+
+如果 trust 缺失、session 已过期且无法 refresh、或者 TLS 指纹与本地 pin 不一致，就不会恢复 `gatewayAuth`。
+
+这正好解释了一个很容易误判的现象：
+
+- 把 `ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`
+- 但没有 `CLAUDE_CODE_USE_GATEWAY`
+- 也没有通过 enterprise gateway 登录/恢复拿到 `Ht.gatewayAuth`
+
+此时：
+
+- `zy() === null/false`
+- `wn()` 不会走 `"gateway"`
+- 也没有 `BEDROCK / VERTEX / FOUNDRY / MANTLE` 这些显式 provider flag
+- 所以 `wn()` 会直接回落成 `"firstParty"`
+
+然后再由 `dd()` 二次检查 base URL 是否真的是 `api.anthropic.com`。因此 DeepSeek-compatible 自定义 base URL 的典型结果是：
+
+- `wn() === "firstParty"`
+- `dd() === false`
+
+这也是为什么 2.1.204 的 attribution builder 代码必须写成：
+
+```js
+(provider === "firstParty" && dd()) || provider === "vertex"
+```
+
+而不能只写 `provider === "firstParty"`。
+
+#### `dd()` 不是 OAuth scope 检查；旁边的 `H2l()` 才是
+
+`dd()` 很容易和它旁边另一个 helper 混淆。真正检查 OAuth inference scope 的是：
+
+```js
+function H2l(e) {
+  return e.anthropicAuthEnabled &&
+    Boolean(e.oauthScopes?.includes("user:inference"));
+}
+```
+
+这里的常量 `P8` 实际值是 `user:inference`。它用于“当前 OAuth token 是否具备 Claude inference scope”这类认证流程判断，不参与 `dd()` 的 base URL 判断。
 
 #### `x-anthropic-billing-header` 三个子字段
 
