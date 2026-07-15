@@ -1,8 +1,8 @@
 # Claude Code 2.1.204 三条遥测链路详解
 
 > 分析对象：macOS arm64，Claude Code `2.1.204`。  
-> 分析日期：2026-07-14（Asia/Shanghai）。  
-> 证据来源：2.1.204 内嵌 JavaScript 静态恢复、Bun preload 网络 JSONL、mitmproxy HAR、本机 `~/.claude.json` GrowthBook 缓存。  
+> 分析日期：2026-07-14 ~ 2026-07-15（Asia/Shanghai）。  
+> 证据来源：2.1.204 内嵌 JavaScript 静态恢复、Bun preload 网络 JSONL、mitmproxy HAR、本机 `~/.claude.json` GrowthBook 缓存；并补充了 2026-07-15 官方直连 + proxy trace 样本。  
 > 本文包含真实的持久化 `device_id`、session UUID、环境特征和公开的 Datadog client token，应按敏感材料保存。
 
 命名约定：环境变量、feature flag、killswitch、provider 枚举和配置 key 一律保留 Claude Code 2.1.204 中的英文原名；中文只解释作用，不把开关名称翻译成中文别名。
@@ -13,350 +13,38 @@
 |---|---|---|---|
 | 1P Event Logging | Claude Code 内部产品事件、性能、工具使用、API 结果和 GrowthBook 实验曝光 | `POST https://api.anthropic.com/api/event_logging/v2/batch` | 是；HAR 中 11 个 batch、240 个事件全部被服务端接受 |
 | Datadog datalog | 经过事件白名单筛选后的扁平化运行日志 | `POST https://http-intake.logs.us5.datadoghq.com/api/v2/logs` | 是；hook 测试中 10 个 batch、96 条事件，捕获到 7 个 HTTP 202 |
-| GrowthBook | 拉取 feature flag/实验分配；通过 SSE 接收配置更新 | `POST https://api.anthropic.com/api/eval/sdk-zAZezfDKGoZuXXKe`；`GET https://api.anthropic.com/sub/sdk-zAZezfDKGoZuXXKe` | 本轮没有；当前无可用于 GrowthBook 的官方 auth header，实际使用磁盘缓存的 13 个 feature 值 |
+| GrowthBook | 拉取 feature flag/实验分配；通过 SSE 接收配置更新 | `POST https://api.anthropic.com/api/eval/sdk-zAZezfDKGoZuXXKe`；`GET https://api.anthropic.com/sub/sdk-zAZezfDKGoZuXXKe` | DeepSeek 样本没有；2026-07-15 官方直连 proxy 样本观察到 `/api/eval` 请求，响应 403，因此没有继续进入 `/sub` |
 
 一个容易混淆的关系是：GrowthBook 的配置拉取属于第三条链，但实验曝光事件不会发往单独的 GrowthBook logging URL，而是转换成 `GrowthbookExperimentEvent` 后进入第一条 1P batch。
 
+### 官方直连相对 DeepSeek 样本新增观察
+
+- 官方直连时，GrowthBook 不再停留在纯本地缓存分支，而是会真实发起 `POST /api/eval/sdk-zAZezfDKGoZuXXKe`；旧 DeepSeek 样本没有这一步。
+- 官方直连的 1P 事件里，`auth.account_uuid`、`auth.organization_uuid`、`head_sha` 本轮真实出现；旧 DeepSeek 代表样本里这些字段没有出现。
+- `env.is_claude_ai_auth` 在官方直连样本中为 `true`；旧 DeepSeek 样本为 `false`。
+- GrowthBook `/api/eval` 的 `attributes` 在官方直连样本里出现 `organizationUUID`、`accountUUID`、`subscriptionType`、`rateLimitTier`，同时不再出现自定义 upstream 才会有的 `apiBaseUrlHost`；旧 DeepSeek 样本刚好相反。
+- 官方直连的 proxy 样本在 `system[0].text` 中真实看到了 `x-anthropic-billing-header: ... cch=00000;` 占位符；旧 DeepSeek proxy 样本在同层没有观察到这一占位符。这个差异只说明“上层 request builder 可见性”不同，不改变最终 `cch` 仍由 native body-prepare 改写的结论。
+
 ## 共同前置概念
 
-### `firstParty` 不等于请求一定发往 Anthropic
+### `firstParty` 不等于官方直连
 
-2.1.204 的 provider 枚举只排除 Gateway、Bedrock、Vertex、Foundry、Anthropic AWS 和 Mantle；普通的自定义 `ANTHROPIC_BASE_URL` 仍返回 `firstParty`：
+2.1.204 的 provider 枚举只把 Gateway、Bedrock、Vertex、Foundry、Anthropic AWS 和 Mantle 分出去；普通自定义 `ANTHROPIC_BASE_URL` 仍会落到 `firstParty`。所以旧 DeepSeek 样本虽然实际请求发往 `https://api.deepseek.com/anthropic/v1/messages`，内部事件依然会记录 `provider = firstParty`。
 
-```js
-function getAPIProvider() {
-  if (gatewayAuth) return "gateway";
-  if (CLAUDE_CODE_USE_BEDROCK) return "bedrock";
-  if (CLAUDE_CODE_USE_FOUNDRY) return "foundry";
-  if (CLAUDE_CODE_USE_ANTHROPIC_AWS) return "anthropicAws";
-  if (CLAUDE_CODE_USE_MANTLE) return "mantle";
-  if (CLAUDE_CODE_USE_VERTEX) return "vertex";
-  return "firstParty";
-}
-```
+### 模型请求中的 attribution builder
 
-因此本机虽然模型请求实际发往 `https://api.deepseek.com/anthropic/v1/messages`，内部事件仍记录：
+`x-anthropic-billing-header` 不是 HTTP header，而是模型请求 JSON body 里 `system[0].text` 的一行 attribution 文本。JavaScript 层负责拼 `cc_version`、`cc_entrypoint`，并在部分路径下先放一个 `cch=00000` 占位符；最终真实的 5 位 `cch` 一定是在 native body-prepare 阶段原地改写，不是 JavaScript 直接算出来的。
 
-```text
-provider = firstParty
-model = deepseek-v4-pro
-envModel = deepseek-v4-pro
-baseUrl = efdbb18afca7
-```
+上层 builder 什么时候会先放 `cch=00000`，当前可以压成两条：
 
-### `baseUrl` 的规范化与哈希算法
+- `provider === "vertex"`
+- `provider === "firstParty"` 且当前 upstream 被视为官方 Anthropic（未设置 `ANTHROPIC_BASE_URL`，或其 `host` 精确等于 `api.anthropic.com`；内部 `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` 也可强制满足）
 
-1P 事件中的 `baseUrl` 来自 `ANTHROPIC_BASE_URL`，不是 SDK 最后拼出的 `/v1/messages?beta=true` 请求 URL。2.1.204 的等价实现如下：
+因此：
 
-```js
-function normalizeBaseUrl(raw) {
-  if (!raw) return raw;
-
-  try {
-    const url = new URL(raw);
-    if (!url.host) throw new TypeError("opaque");
-
-    url.username = "";
-    url.password = "";
-    url.search = "";
-    url.hash = "";
-
-    return url.toString().replace(/\/$/, "");
-  } catch {
-    // 非标准 URL 的 fallback：去掉 query/fragment，再去掉最后一个 @ 之前的内容。
-    const withoutQueryOrFragment = raw.split("?")[0].split("#")[0];
-    const at = withoutQueryOrFragment.lastIndexOf("@");
-    return at >= 0
-      ? withoutQueryOrFragment.slice(at + 1)
-      : withoutQueryOrFragment;
-  }
-}
-
-function hostnameForDomainCheck(value) {
-  const candidate = value.startsWith("//") ? `https:${value}` : value;
-  let hostname;
-
-  try {
-    hostname = new URL(candidate).hostname;
-  } catch {
-    hostname = value.match(/^[^/:]+/)?.[0] ?? value;
-  }
-
-  return hostname.endsWith(".") ? hostname.slice(0, -1) : hostname;
-}
-
-function isAnthropicDomain(value) {
-  return /(^|\.)(anthropic\.com|claude\.ai|claude\.com)$/i.test(
-    hostnameForDomainCheck(value)
-  );
-}
-
-function telemetryBaseUrl(raw) {
-  const normalized = normalizeBaseUrl(raw);
-
-  // 官方域名保留规范化后的 URL 明文，不做哈希。
-  if (isAnthropicDomain(normalized)) {
-    return normalized;
-  }
-
-  // crypto.update(string) 使用 UTF-8；结果为小写 hex 的前 12 位。
-  return crypto
-    .createHash("sha256")
-    .update(normalized)
-    .digest("hex")
-    .slice(0, 12);
-}
-```
-
-当前真实输入和结果：
-
-```text
-ANTHROPIC_BASE_URL = https://api.deepseek.com/anthropic
-normalized         = https://api.deepseek.com/anthropic
-SHA-256 prefix     = efdbb18afca7
-1P baseUrl         = efdbb18afca7
-```
-
-可直接复算：
-
-```sh
-printf '%s' 'https://api.deepseek.com/anthropic' | shasum -a 256 | cut -c1-12
-# efdbb18afca7
-```
-
-路径会参与哈希，但末尾 `/`、URL credentials、query 和 fragment 不会参与：
-
-| 原始值 | 规范化值 | 1P `baseUrl` |
-|---|---|---|
-| `https://api.deepseek.com` | `https://api.deepseek.com` | `a34e2a4708ed` |
-| `https://api.deepseek.com/` | `https://api.deepseek.com` | `a34e2a4708ed` |
-| `https://api.deepseek.com/anthropic` | `https://api.deepseek.com/anthropic` | `efdbb18afca7` |
-| `https://api.deepseek.com/anthropic/v1` | `https://api.deepseek.com/anthropic/v1` | `38be6316416c` |
-
-注意：GrowthBook 的 `attributes.apiBaseUrlHost` 不复用这套哈希逻辑，而是通过 `new URL(ANTHROPIC_BASE_URL).host` 采集明文 host；本机真实值为 `api.deepseek.com`。
-
-### 模型请求中的 attribution payload 与其他常见 request header 生成方式
-
-`x-anthropic-billing-header` 在 2.1.204 里容易看错：它不是 HTTP header，而是模型请求 JSON body 里 `system[0].text` 的一行 attribution 文本。这里还要分清两层：
-
-- 上层 JavaScript request builder 有时只会生成 `cc_version` / `cc_entrypoint`
-- 在另一条分支上，上层 JavaScript request builder 会先放入 `cch=00000`
-- 最终真实的 5 位 `cch` 值始终不是 JavaScript 算出来的，而是 native body-prepare 阶段原地覆写
-
-因此，普通 preload / JSONL：
-
-- 有时只能看到：
-
-```text
-x-anthropic-billing-header: cc_version=2.1.204.<fp>; cc_entrypoint=sdk-cli;
-```
-
-- 有时会直接看到：
-
-```text
-x-anthropic-billing-header: cc_version=2.1.204.<fp>; cc_entrypoint=sdk-cli; cch=00000;
-```
-
-受控 Frida/native probe 证明：不论 placeholder 是否已经在 JavaScript 层出现，最终真实 `cch` 都是在 native body prepare 阶段才改写成 5 位 hex；所以普通 preload 看不到 placeholder，不代表最终 wire body 没有 `cch`；而 preload 即使看到了 `cch=00000`，也不代表最终值是 JavaScript 生成的。
-
-#### `cch=00000` 什么时候会被上层 request builder 放进 body
-
-2.1.204 里 attribution builder 的核心逻辑可以还原为：
-
-```js
-function AIn(fp3, agentContext, prevReqId) {
-  if (CLAUDE_CODE_ATTRIBUTION_HEADER is disabled) return "";
-
-  const provider = wn();
-  const addCchPlaceholder =
-    (provider === "firstParty" && dd()) ||
-    provider === "vertex";
-
-  // ...
-}
-```
-
-其中 `wn()` 只是 provider 分类器：
-
-```js
-function wn() {
-  if (gatewayAuth) return "gateway";
-  if (CLAUDE_CODE_USE_BEDROCK) return "bedrock";
-  if (CLAUDE_CODE_USE_FOUNDRY) return "foundry";
-  if (CLAUDE_CODE_USE_ANTHROPIC_AWS) return "anthropicAws";
-  if (CLAUDE_CODE_USE_MANTLE) return "mantle";
-  if (CLAUDE_CODE_USE_VERTEX) return "vertex";
-  return "firstParty";
-}
-```
-
-所以 `provider === "firstParty"` 本身并不够，它只说明“当前没有落到 Bedrock / Vertex / Foundry / Mantle / Gateway 这些分支”，未必代表模型请求真的还在打官方 Anthropic base URL。
-
-真正负责 second gate 的是 `dd()`：
-
-```js
-function dd() {
-  if (_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL) return true;
-  return kxn();
-}
-
-function kxn() {
-  const baseUrl = process.env.ANTHROPIC_BASE_URL;
-  if (!baseUrl) return true;
-  return dke(baseUrl);
-}
-
-function dke(baseUrl) {
-  try {
-    return ["api.anthropic.com"].includes(new URL(baseUrl).host);
-  } catch {
-    return false;
-  }
-}
-```
-
-这意味着：
-
-- 未设置 `ANTHROPIC_BASE_URL`：`dd() === true`
-- `ANTHROPIC_BASE_URL` 的 `host` 精确等于 `api.anthropic.com`：`dd() === true`
-- 自定义 DeepSeek-compatible base URL、本地 loopback、任意自建 gateway：`dd() === false`
-- 内部 override `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` 可强制 `dd() === true`
-
-按代码字面，它比较的是 `new URL(...).host`，不是 `hostname`；因此显式端口也会影响比较结果，例如 `api.anthropic.com:443` 也会被视为不同 host。
-
-所以，上层 builder 会把 `cch=00000` 放进 body 的条件可以精确写成：
-
-- `wn() === "vertex"`；或
-- `wn() === "firstParty"` 且 `dd() === true`
-
-反过来说：
-
-- 只要 `ANTHROPIC_BASE_URL` 已经切到 `https://api.deepseek.com/anthropic`
-- 且没有 `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` 这种内部 override
-
-那么默认 JavaScript builder 就不会先放入 `cch=00000`。
-
-#### `zy()` / `gatewayAuth`：为什么自定义 `ANTHROPIC_BASE_URL` 不会自动变成 `"gateway"`
-
-`wn()` 的第一分支不是“只要设置了自定义 `ANTHROPIC_BASE_URL` 就算 gateway”，而是：
-
-```js
-function zy() {
-  return Ht.gatewayAuth;
-}
-
-function wn() {
-  if (zy()) return "gateway";
-  if (CLAUDE_CODE_USE_BEDROCK) return "bedrock";
-  if (CLAUDE_CODE_USE_FOUNDRY) return "foundry";
-  if (CLAUDE_CODE_USE_ANTHROPIC_AWS) return "anthropicAws";
-  if (CLAUDE_CODE_USE_MANTLE) return "mantle";
-  if (CLAUDE_CODE_USE_VERTEX) return "vertex";
-  return "firstParty";
-}
-```
-
-也就是说，是否进入 `"gateway"` provider，不取决于你有没有改 `ANTHROPIC_BASE_URL`，而取决于进程内状态 `Ht.gatewayAuth` 是否已经被填上。
-
-这个状态的最小结构可以从 restore / bootstrap 逻辑直接看到：
-
-```js
-J2e({
-  url: gatewayUrl,
-  jwt: gatewayJwt,
-  expiresAt: <timestamp ms>,
-  unpinned: true | false
-})
-```
-
-当前可直接确认的字段语义：
-
-- `url`：gateway base URL
-- `jwt`：gateway bearer token
-- `expiresAt`：过期时间；`g5o()` 用它判断是否过期
-- `unpinned`：是否未做 TLS pin；`Dft(e)` 用 `!e.unpinned` 判断“是否 pinned”
-
-相关 helper：
-
-```js
-function zy() {
-  return Ht.gatewayAuth;
-}
-
-function g5o() {
-  const e = Ht.gatewayAuth;
-  return !!e && e.expiresAt <= Date.now();
-}
-
-function Dft(e) {
-  return !!e && !e.unpinned;
-}
-
-function J2e(e) {
-  Ht.gatewayAuth = e;
-}
-```
-
-`gatewayAuth` 的来源在 2.1.204 里主要有两类：
-
-1. 显式 gateway 模式：
-
-```js
-if (CLAUDE_CODE_USE_GATEWAY) {
-  // read ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN
-  J2e({ url, jwt, expiresAt, unpinned: true })
-}
-```
-
-这种模式只是把环境变量里的 gateway URL / token 装进 `gatewayAuth`，并显式标成 `unpinned: true`。
-
-2. 恢复已保存的 enterprise gateway 会话：
-
-- 从本地持久化状态读取 `enterpriseGateway`
-- 按 hostname 查本机保存的 `gatewayTrust`
-- 若存在 pin，则尝试做 TLS fingerprint probe
-- 验证通过后 `J2e(t)`
-
-如果 trust 缺失、session 已过期且无法 refresh、或者 TLS 指纹与本地 pin 不一致，就不会恢复 `gatewayAuth`。
-
-这正好解释了一个很容易误判的现象：
-
-- 把 `ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`
-- 但没有 `CLAUDE_CODE_USE_GATEWAY`
-- 也没有通过 enterprise gateway 登录/恢复拿到 `Ht.gatewayAuth`
-
-此时：
-
-- `zy() === null/false`
-- `wn()` 不会走 `"gateway"`
-- 也没有 `BEDROCK / VERTEX / FOUNDRY / MANTLE` 这些显式 provider flag
-- 所以 `wn()` 会直接回落成 `"firstParty"`
-
-然后再由 `dd()` 二次检查 base URL 是否真的是 `api.anthropic.com`。因此 DeepSeek-compatible 自定义 base URL 的典型结果是：
-
-- `wn() === "firstParty"`
-- `dd() === false`
-
-这也是为什么 2.1.204 的 attribution builder 代码必须写成：
-
-```js
-(provider === "firstParty" && dd()) || provider === "vertex"
-```
-
-而不能只写 `provider === "firstParty"`。
-
-#### `dd()` 不是 OAuth scope 检查；旁边的 `H2l()` 才是
-
-`dd()` 很容易和它旁边另一个 helper 混淆。真正检查 OAuth inference scope 的是：
-
-```js
-function H2l(e) {
-  return e.anthropicAuthEnabled &&
-    Boolean(e.oauthScopes?.includes("user:inference"));
-}
-```
-
-这里的常量 `P8` 实际值是 `user:inference`。它用于“当前 OAuth token 是否具备 Claude inference scope”这类认证流程判断，不参与 `dd()` 的 base URL 判断。
+- 官方直连 proxy 样本在 `system[0].text` 中看到了 `cch=00000`
+- 旧 DeepSeek proxy 样本在同层没有看到这个占位符
+- 这个差异只影响 JavaScript 层可见性，不影响最终 `cch` 仍由 native 改写
 
 #### `x-anthropic-billing-header` 三个子字段
 
@@ -515,8 +203,8 @@ POST https://api.anthropic.com/api/event_logging/v2/batch
 | `client_type` | 客户端类型 | 运行时状态 | `sdk-cli` |
 | `process` | 进程指标 | `process.memoryUsage()`、`process.cpuUsage()` 等；JSON 后 base64 | 见下方解码示例 |
 | `additional_metadata` | 事件特有字段 | 调用方 metadata 过滤后 JSON/base64 | 见下方 `tengu_api_success` 解码示例 |
-| `auth.account_uuid` | Anthropic 账户 UUID | OAuth/account profile | 当前未上报 |
-| `auth.organization_uuid` | Anthropic 组织 UUID | OAuth/account profile | 当前未上报 |
+| `auth.account_uuid` | Anthropic 账户 UUID | OAuth/account profile | DeepSeek 代表样本未出现；官方直连样本出现 `1c591bcf-c5d4-4931-b5bd-7362b8a4cc32` |
+| `auth.organization_uuid` | Anthropic 组织 UUID | OAuth/account profile | DeepSeek 代表样本未出现；官方直连样本出现 `40e875d4-3561-4853-9bd1-5dacef51a557` |
 | `email` | 邮箱 | 账户上下文 | 当前未上报 |
 | `agent_id` | 子 agent ID | agent async context | 当前代表事件未上报 |
 | `parent_session_id` | 父会话 ID | agent async context | 当前代表事件未上报 |
@@ -526,7 +214,7 @@ POST https://api.anthropic.com/api/event_logging/v2/batch
 | `plugin_name` | plugin 名 | `_PROTO_plugin_name` 特殊提升 | 仅相关事件出现 |
 | `marketplace_name` | marketplace 名 | `_PROTO_marketplace_name` 特殊提升 | 仅相关事件出现 |
 | `repl_code` | REPL 相关 code | `_PROTO_code` 特殊提升 | 仅相关事件出现 |
-| `head_sha` | Git HEAD SHA/派生值 | Git 上下文 | 当前代表事件未上报 |
+| `head_sha` | Git HEAD SHA/派生值 | Git 上下文 | DeepSeek 代表样本未出现；官方直连样本出现 `38e9e9ce6268ddd23ad7d5abc2c4b5584a1d7ed1` |
 | `swe_bench_run_id` | SWE-bench run | 环境变量 | 当前为空 |
 | `swe_bench_instance_id` | SWE-bench instance | 环境变量 | 当前为空 |
 | `swe_bench_task_id` | SWE-bench task | 环境变量 | 当前为空 |
@@ -547,7 +235,7 @@ POST https://api.anthropic.com/api/event_logging/v2/batch
 | `is_claubbit` | 内部运行环境检测 | `false` |
 | `is_github_action` | `GITHUB_ACTIONS` 等环境检测 | `false` |
 | `is_claude_code_action` | Claude Code Action 环境检测 | `false` |
-| `is_claude_ai_auth` | Claude.ai OAuth auth 判定 | `false` |
+| `is_claude_ai_auth` | Claude.ai OAuth auth 判定 | DeepSeek 样本为 `false`；官方直连样本为 `true` |
 | `is_claude_code_remote` | Remote 环境 | `false` |
 | `is_local_agent_mode` | local-agent entrypoint | `false` |
 | `is_conductor` | Conductor 环境 | `false` |
@@ -623,7 +311,27 @@ POST https://api.anthropic.com/api/event_logging/v2/batch
 }
 ```
 
-这里没有直接上传 prompt 文本，但上传了输入字符数、估算 token、thinking/text 长度、模型、成本、耗时、TTFT、query chain 和 base URL 哈希。其他事件类型可能携带不同 metadata。
+这里的 `baseUrl` 来自 `ANTHROPIC_BASE_URL`，不是最终 `/v1/messages?...` 请求 URL。1P 链路会先做规范化（去掉 credentials、query、fragment 和末尾 `/`），然后：
+
+- 若 host 属于 `anthropic.com` / `claude.ai` / `claude.com`，保留规范化后的 URL 明文
+- 否则对规范化结果做 `SHA-256`，取小写 hex 前 12 位
+
+当前 DeepSeek 样本中：
+
+```text
+ANTHROPIC_BASE_URL = https://api.deepseek.com/anthropic
+normalized         = https://api.deepseek.com/anthropic
+1P baseUrl         = efdbb18afca7
+```
+
+可直接复算：
+
+```sh
+printf '%s' 'https://api.deepseek.com/anthropic' | shasum -a 256 | cut -c1-12
+# efdbb18afca7
+```
+
+路径会参与这 12 位哈希，因此 `https://api.deepseek.com` 与 `https://api.deepseek.com/anthropic` 会得到不同值。这里没有直接上传 prompt 文本，但上传了输入字符数、估算 token、thinking/text 长度、模型、成本、耗时、TTFT、query chain 和 base URL 信息。其他事件类型可能携带不同 metadata。
 
 ### 1.8 真实发送结果
 
@@ -907,7 +615,7 @@ SDK refresh 周期与缓存相关参数：
 | `attributes.deviceID` | 同一 device ID 的兼容字段 | Claude Code `device_id` |
 | `attributes.sessionId` | 当前会话 UUID | session state |
 | `attributes.platform` | 平台 | `darwin` 等 |
-| `attributes.apiBaseUrlHost` | 仅自定义 API host 时加入 | `new URL(ANTHROPIC_BASE_URL).host` |
+| `attributes.apiBaseUrlHost` | 仅自定义 API host 时加入 | `new URL(ANTHROPIC_BASE_URL).host`；DeepSeek 样本为 `api.deepseek.com`，官方直连样本不出现该字段 |
 | `attributes.organizationUUID` | 组织 UUID | OAuth/account 或环境变量 |
 | `attributes.accountUUID` | 账户 UUID | OAuth/account 或环境变量 |
 | `attributes.userType` | 用户类型 | 当前固定/解析为 `external` |
@@ -924,9 +632,11 @@ SDK refresh 周期与缓存相关参数：
 | `forcedFeatures` | 本地强制 feature map 转数组 | GrowthBook runtime overrides |
 | `url` | SDK 上下文 URL | CLI 场景通常为空字符串 |
 
+注意这里和 1P 不一样：GrowthBook 只在自定义 upstream 时上传 `attributes.apiBaseUrlHost`，而且是 `new URL(ANTHROPIC_BASE_URL).host` 的明文值，不做规范化哈希。
+
 ### 3.3 当前状态下计算出的真实属性值
 
-以下值来自与 datalog 样本相同的 PID 98380 会话状态。它们是代码会用于 remote-eval body 的真实当前值，但本轮没有成功形成线上 `/api/eval` 请求：
+先看旧 DeepSeek 样本。以下值来自与 datalog 样本相同的 PID 98380 会话状态。它们是代码会用于 remote-eval body 的真实当前值，但当时没有成功形成线上 `/api/eval` 请求：
 
 ```json
 {
@@ -948,7 +658,39 @@ SDK refresh 周期与缓存相关参数：
 
 当前没有 `organizationUUID`、`accountUUID`、`subscriptionType`、`rateLimitTier`、`firstTokenTime`、`email`、`releaseChannel` 或 `hasUsedRemoteSession`，因此这些 key 会省略，而不是发送 `null`。
 
-### 3.4 为什么这轮没有 `/api/eval` 和 `/sub`
+补充：2026-07-15 官方直连 proxy 样本里，真实发出的 `/api/eval` body 变成：
+
+```json
+{
+  "attributes": {
+    "id": "3a232b1a1d788667a15e0720564540eb32345f739c5a36ec20f91587c1f6d93d",
+    "sessionId": "5207a445-54cb-4357-9862-129836c6b7f9",
+    "deviceID": "3a232b1a1d788667a15e0720564540eb32345f739c5a36ec20f91587c1f6d93d",
+    "platform": "darwin",
+    "organizationUUID": "40e875d4-3561-4853-9bd1-5dacef51a557",
+    "accountUUID": "1c591bcf-c5d4-4931-b5bd-7362b8a4cc32",
+    "userType": "external",
+    "subscriptionType": "pro",
+    "rateLimitTier": "default_claude_ai",
+    "appVersion": "2.1.204",
+    "entrypoint": "sdk-cli"
+  },
+  "forcedVariations": {},
+  "forcedFeatures": [],
+  "url": ""
+}
+```
+
+也就是说，官方直连相对旧 DeepSeek 样本新增了：
+
+- `organizationUUID`
+- `accountUUID`
+- `subscriptionType`
+- `rateLimitTier`
+
+同时不再携带 `apiBaseUrlHost`。
+
+### 3.4 为什么 DeepSeek 样本没有 `/api/eval` 和 `/sub`
 
 Claude Code 只有在官方 auth header 解析成功后才执行 GrowthBook SDK `init()` 网络请求。当前 DeepSeek token/base URL 场景下，GrowthBook 初始化没有得到可用的官方 `Authorization`/`x-api-key` headers，于是：
 
@@ -957,6 +699,11 @@ Claude Code 只有在官方 auth header 解析成功后才执行 GrowthBook SDK 
 - 继续使用 `~/.claude.json` 中的 `cachedGrowthBookFeatures`。
 
 这与抓包一致：两份 HAR 和当前 JSONL 都没有 `eval`、`sub` 或 `features` 请求。
+
+而在 2026-07-15 官方直连 proxy 样本里，`/api/eval` 已经真实发起，只是服务端返回 403，所以仍然没有继续进入 `/sub`。这说明：
+
+- “DeepSeek 样本没有 `/api/eval`” 的原因是没有可用官方 auth header；
+- “官方直连样本没有 `/sub`” 的原因则是 `/api/eval` 已发起但被服务端拒绝。
 
 ### 3.5 本机当前实际应用的 feature 值
 
