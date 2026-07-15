@@ -98,6 +98,7 @@ function createCollector(maxBytes) {
   const chunks = [];
   let captured = 0;
   let total = 0;
+  let forcedTruncated = false;
   return {
     add(value, encoding) {
       const buffer = toBuffer(value, encoding);
@@ -110,13 +111,98 @@ function createCollector(maxBytes) {
       }
       return true;
     },
+    markTruncated() {
+      forcedTruncated = true;
+    },
     finish(type, redactSecrets) {
-      return bodyValue(Buffer.concat(chunks), type, redactSecrets, total, total > captured);
+      return bodyValue(Buffer.concat(chunks), type, redactSecrets, total, forcedTruncated || total > captured);
     },
     get totalBytes() {
       return total;
     },
+    get isFull() {
+      return captured >= maxBytes;
+    },
   };
+}
+
+async function readWebStreamIntoCollector(stream, collector) {
+  if (!stream || typeof stream.getReader !== 'function') return false;
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      collector.add(value);
+      if (collector.isFull) {
+        collector.markTruncated();
+        try {
+          await reader.cancel();
+        } catch {}
+        break;
+      }
+    }
+    return true;
+  } finally {
+    try {
+      reader.releaseLock?.();
+    } catch {}
+  }
+}
+
+function emitResponseEnd(state, context, responseLike, started, body, extra = {}) {
+  state.emit({
+    phase: 'response-end',
+    layer: 'http',
+    transport: context.transport,
+    requestId: context.requestId,
+    method: context.method,
+    url: context.url,
+    status: responseLike?.status ?? responseLike?.statusCode,
+    statusText: responseLike?.statusText ?? responseLike?.statusMessage,
+    durationMs: Number((performance.now() - started).toFixed(3)),
+    body,
+    ...extra,
+  });
+}
+
+async function captureFetchResponseBody(response, context, started, state) {
+  const collector = createCollector(state.options.maxBodyBytes);
+  const rawHeaders = headerObject(response?.headers, false);
+  const type = contentType(rawHeaders);
+
+  if (!response) {
+    emitResponseEnd(state, context, response, started, { omitted: true, reason: 'no response object' });
+    return;
+  }
+
+  let clone;
+  try {
+    clone = typeof response.clone === 'function' ? response.clone() : response;
+  } catch (error) {
+    emitResponseEnd(state, context, response, started, { omitted: true, reason: String(error) });
+    return;
+  }
+
+  try {
+    if (await readWebStreamIntoCollector(clone.body, collector)) {
+      emitResponseEnd(state, context, response, started, collector.finish(type, state.options.redactSecrets));
+      return;
+    }
+    if (typeof clone.arrayBuffer === 'function') {
+      collector.add(await clone.arrayBuffer());
+      emitResponseEnd(state, context, response, started, collector.finish(type, state.options.redactSecrets));
+      return;
+    }
+    if (typeof clone.text === 'function') {
+      collector.add(await clone.text());
+      emitResponseEnd(state, context, response, started, collector.finish(type, state.options.redactSecrets));
+      return;
+    }
+    emitResponseEnd(state, context, response, started, { omitted: true, reason: 'unsupported response body type' });
+  } catch (error) {
+    emitResponseEnd(state, context, response, started, { omitted: true, reason: String(error) });
+  }
 }
 
 function requestUrl(input, options = {}, defaultProtocol = 'https:') {
@@ -222,6 +308,16 @@ function installRequestBodyCapture(request, context, state) {
 
   request.once?.('response', response => {
     emitRequest();
+    const responseCollector = createCollector(state.options.maxBodyBytes);
+    const rawResponseHeaders = headerObject(response.headers, false);
+    let responseEnded = false;
+
+    if (state.options.captureResponseBodies) {
+      response.on?.('data', chunk => {
+        responseCollector.add(chunk);
+      });
+    }
+
     state.emit({
       phase: 'response',
       layer: 'http',
@@ -234,13 +330,24 @@ function installRequestBodyCapture(request, context, state) {
       headers: headerObject(response.headers, state.options.redactSecrets),
       durationMs: Number((performance.now() - context.started).toFixed(3)),
     });
-    response.once?.('end', () => state.emit({
-      phase: 'response-end',
-      layer: 'http',
-      transport: context.transport,
-      requestId: context.requestId,
-      durationMs: Number((performance.now() - context.started).toFixed(3)),
-    }));
+
+    const finalizeResponse = extra => {
+      if (responseEnded) return;
+      responseEnded = true;
+      emitResponseEnd(
+        state,
+        context,
+        response,
+        context.started,
+        state.options.captureResponseBodies
+          ? responseCollector.finish(contentType(rawResponseHeaders), state.options.redactSecrets)
+          : { omitted: true, reason: 'response body capture disabled' },
+        extra,
+      );
+    };
+
+    response.once?.('end', () => finalizeResponse());
+    response.once?.('close', () => finalizeResponse({ closed: true }));
   });
   request.once?.('error', error => state.emit({
     phase: 'error',
@@ -344,18 +451,35 @@ function installFetch(state) {
         throw error;
       }
       Promise.resolve(result).then(
-        response => state.emit({
-          phase: 'response',
-          layer: 'http',
-          transport: 'fetch',
-          requestId,
-          method: details.method,
-          url: details.url,
-          status: response?.status,
-          statusText: response?.statusText,
-          headers: headerObject(response?.headers, state.options.redactSecrets),
-          durationMs: Number((performance.now() - started).toFixed(3)),
-        }),
+        response => {
+          state.emit({
+            phase: 'response',
+            layer: 'http',
+            transport: 'fetch',
+            requestId,
+            method: details.method,
+            url: details.url,
+            status: response?.status,
+            statusText: response?.statusText,
+            headers: headerObject(response?.headers, state.options.redactSecrets),
+            durationMs: Number((performance.now() - started).toFixed(3)),
+          });
+          if (state.options.captureResponseBodies) {
+            void captureFetchResponseBody(response, {
+              transport: 'fetch',
+              requestId,
+              method: details.method,
+              url: details.url,
+            }, started, state);
+          } else {
+            emitResponseEnd(state, {
+              transport: 'fetch',
+              requestId,
+              method: details.method,
+              url: details.url,
+            }, response, started, { omitted: true, reason: 'response body capture disabled' });
+          }
+        },
         error => state.emit({
           phase: 'error',
           layer: 'http',
@@ -402,11 +526,38 @@ function installHttp2(state) {
           });
           return Reflect.apply(rawEnd, this, arguments);
         };
-        stream.once?.('response', responseHeaders => state.emit({
-          phase: 'response', layer: 'http', transport: 'http2', connectionId, requestId, method, url,
-          status: responseHeaders[':status'], headers: headerObject(responseHeaders, state.options.redactSecrets),
-          durationMs: Number((performance.now() - started).toFixed(3)),
-        }));
+        const responseCollector = createCollector(state.options.maxBodyBytes);
+        let responseHeaders = {};
+        let responseEnded = false;
+        if (state.options.captureResponseBodies) {
+          stream.on?.('data', chunk => {
+            responseCollector.add(chunk);
+          });
+        }
+        stream.once?.('response', nextResponseHeaders => {
+          responseHeaders = nextResponseHeaders || {};
+          state.emit({
+            phase: 'response', layer: 'http', transport: 'http2', connectionId, requestId, method, url,
+            status: responseHeaders[':status'], headers: headerObject(responseHeaders, state.options.redactSecrets),
+            durationMs: Number((performance.now() - started).toFixed(3)),
+          });
+        });
+        const finalizeResponse = extra => {
+          if (responseEnded) return;
+          responseEnded = true;
+          emitResponseEnd(
+            state,
+            { transport: 'http2', requestId, method, url },
+            { status: responseHeaders[':status'] },
+            started,
+            state.options.captureResponseBodies
+              ? responseCollector.finish(contentType(headerObject(responseHeaders, false)), state.options.redactSecrets)
+              : { omitted: true, reason: 'response body capture disabled' },
+            { connectionId, ...extra },
+          );
+        };
+        stream.once?.('end', () => finalizeResponse());
+        stream.once?.('close', () => finalizeResponse({ closed: true }));
         stream.once?.('error', error => state.emit({ phase: 'error', layer: 'http', transport: 'http2', connectionId, requestId, error: String(error?.stack || error) }));
         return stream;
       };
@@ -527,6 +678,7 @@ function normalizedOptions(config = {}) {
     maxBodyBytes: Number(process.env.CLAUDE_NETWORK_TRACE_MAX_BODY || config.maxBodyBytes || 2 * 1024 * 1024),
     maxSocketWriteBytes: Number(process.env.CLAUDE_NETWORK_TRACE_MAX_SOCKET_WRITE || config.maxSocketWriteBytes || 256 * 1024),
     captureSocketWrites: config.captureSocketWrites ?? process.env.CLAUDE_NETWORK_TRACE_SOCKET_WRITES === '1',
+    captureResponseBodies: config.captureResponseBodies ?? process.env.CLAUDE_NETWORK_TRACE_CAPTURE_RESPONSE_BODIES !== '0',
     redactSecrets: config.redactSecrets ?? process.env.CLAUDE_NETWORK_TRACE_SECRETS !== '1',
     stderr: config.stderr ?? process.env.CLAUDE_NETWORK_TRACE_STDERR === '1',
   };

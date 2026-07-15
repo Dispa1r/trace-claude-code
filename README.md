@@ -16,7 +16,8 @@ They are ignored by Git and should be handled as sensitive data.
 | Network JSONL | `preload/network_trace.js` | fetch, HTTP/1, HTTP/2, WebSocket, Bun/net/TLS connections |
 | MITM capture | `bin/run-mitmproxy` + `bin/claude-mitm` | decrypted HTTP(S) flows and HAR output |
 | Native tracing | `bin/claude-frida` | `dlopen`, `napi_run_script`, `connect`, version-specific Bun/JSC evaluator |
-| Viewer | `bin/show-network-trace` | correlates requests, responses, errors, and optional connection records |
+| Viewer | `bin/show-network-trace` | correlates requests, response headers, response bodies, errors, and optional connection records |
+| LLM viewer | `bin/show-llm-trace` | filters `/v1/messages`, pretty-prints `system` / `messages` / `tools`, and parses model responses |
 
 The preload path is the recommended starting point. It runs in Claude Code's
 own Bun `globalThis`, so JavaScript objects can be wrapped without guessing
@@ -60,16 +61,58 @@ ${XDG_STATE_HOME}/trace-claude-code
 ~/.local/state/trace-claude-code
 ```
 
-Network bodies are capped at 2 MiB per request. Authentication, API key,
-cookie, token, password, and secret fields are redacted by default, but prompts
-and project data are intentionally captured. Useful controls:
+Network request and response bodies are capped at 2 MiB by default.
+Authentication, API key, cookie, token, password, and secret fields are
+redacted by default, but prompts, model outputs, and project data are
+intentionally captured. Useful controls:
 
 ```sh
 export CLAUDE_NETWORK_TRACE=0                    # disable network tracing
 export CLAUDE_NETWORK_TRACE_MAX_BODY=4194304     # body cap in bytes
 export CLAUDE_NETWORK_TRACE_STDERR=1             # one-line request summaries
 export CLAUDE_NETWORK_TRACE_SOCKET_WRITES=1      # raw socket writes; very noisy
+export CLAUDE_NETWORK_TRACE_CAPTURE_RESPONSE_BODIES=0  # disable response body capture
 export CLAUDE_NETWORK_TRACE_SECRETS=1            # disable redaction; dangerous
+```
+
+## Quick start: LLM trace
+
+Once a network JSONL trace exists, extract only model interactions:
+
+```sh
+bin/show-llm-trace --directory "$PWD/traces"
+```
+
+Useful options:
+
+```sh
+bin/show-llm-trace --directory "$PWD/traces" --headers
+bin/show-llm-trace --directory "$PWD/traces" --raw-response
+```
+
+Typical workflow:
+
+```sh
+export CLAUDE_NETWORK_TRACE_DIR="$PWD/traces"
+export CLAUDE_NETWORK_TRACE_MAX_BODY=8388608
+
+bin/claude-hooked
+bin/show-llm-trace --directory "$PWD/traces"
+```
+
+What you get from `show-llm-trace`:
+
+- the exact `/v1/messages` request URL and method
+- request `model`, `system`, `messages`, and `tools`
+- response status and headers
+- parsed streaming SSE responses, including reconstructed assistant text, tool-use payloads, usage, and stop reason
+
+The raw network JSONL remains the ground-truth source. `show-llm-trace` is only
+a filtered viewer on top of it, so when you need byte-level details you can
+still inspect the same capture with:
+
+```sh
+bin/show-network-trace --directory "$PWD/traces" --headers --bodies
 ```
 
 ## Precise JavaScript method tracing

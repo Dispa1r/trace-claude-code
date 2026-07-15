@@ -84,6 +84,10 @@ def main() -> int:
                     if args.headers:
                         print("response headers:")
                         print(json.dumps(response.get("headers", {}), ensure_ascii=False, indent=2))
+                elif response.get("phase") == "response-end":
+                    if args.bodies:
+                        print("response body:")
+                        print_body(response.get("body") or {})
                 elif response.get("phase") == "error":
                     print(f"error: {response.get('error')}")
         elif args.connections and layer in {"connection", "socket", "websocket"}:
