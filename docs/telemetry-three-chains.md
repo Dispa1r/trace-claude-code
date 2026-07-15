@@ -779,7 +779,99 @@ cachedExperimentFeatures = null
 | prompt 原文 | 本次样本未见 | 本次样本未见 | 否 | 否 |
 | 输入长度/token/成本 | API 事件中有 | 相应 allowlist API 事件可有 | 否 | 否 |
 
-## 5. 证据文件
+---
+
+## 5. 抓包/观测方案对比
+
+这一节单独比较三种常用方案：
+
+- 本地 HTTP 代理：启动本地转发器，然后把 `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` 注入 Claude Code。
+- MITM：通过 `HTTPS_PROXY` / `HTTP_PROXY` + 受信任 CA 做 HTTPS 中间人解密。
+- JS preload / Proxy：在 Claude Code 同进程里通过 `BUN_OPTIONS=--preload=...` 包装 `fetch` / `http` / `http2`。
+
+### 5.1 三种方案分别截获在哪一层
+
+| 方案 | 截获位置 | 能看到什么 | 看不到什么 |
+|---|---|---|---|
+| 本地 HTTP 代理（`ANTHROPIC_BASE_URL`） | Claude Code 应用层和真正 upstream 之间 | Claude Code 发给代理的 `/v1/messages` 请求、SSE 响应、代理转发前后的 body/header | 默认看不到 1P / Datadog / GrowthBook，除非这些链路也被单独路由到代理；也看不到客户端原始 TLS |
+| MITM | 进程出站 HTTPS 与远端之间 | 最终离开进程的真实 HTTP 请求与响应；模型请求、1P、Datadog、GrowthBook 都可一起看到 | 看不到“解密前”的 TLS 指纹真相；上游看到的是 MITM 的 TLS，而不是 Claude 自己的 TLS |
+| JS preload / Proxy | Claude Code 运行时内部，HTTP API 调用点附近 | `system` / `messages` / `tools`、请求参数、SSE 响应片段、函数调用上下文、调用栈附近逻辑 | 看不到 TLS/JA3/JA4；也不保证能看到 native 在最终发包前做的每一步改写 |
+
+### 5.2 优势和劣势
+
+| 方案 | 优势 | 劣势 | 最适合的用途 |
+|---|---|---|---|
+| 本地 HTTP 代理（`ANTHROPIC_BASE_URL`） | 不需要安装 CA；最容易做“边看边改边转发”；对 `/v1/messages` 和 SSE 流特别友好 | 会改动 Claude Code 自身路由条件：`ANTHROPIC_BASE_URL` 变成自定义 host 后，一些行为会切换；按官方文档，非 `api.anthropic.com` host 下 `ENABLE_TOOL_SEARCH` 默认关闭，Remote Control 也会关闭。对三条遥测链来说，它通常不是全量视角 | 做 LLM 请求转发器、回放、在线改写、构建 viewer |
+| MITM | 最接近“最终上网报文”；官方直连场景下不需要改 `ANTHROPIC_BASE_URL`，因此产品逻辑路径更接近真实用户态；可以同时覆盖模型请求、1P、Datadog、GrowthBook | 需要安装并信任 CA；会改变 TLS 指纹、ALPN/HTTP2 细节；对抗性检查、证书校验、pinning 类问题会更敏感 | 做“最终 HTTP 报文真相源”、遥测全量审计、确认 native 改写后的实际 header/body |
+| JS preload / Proxy | 行为漂移最小，不改系统 CA、不改网络拓扑；可以和函数 hook 结合，既看网络也看对象/模块调用；非常适合抽取 `system/messages/tools` 这种语义化 LLM trace | 不等于最终 wire truth：某些字段在这里还只是上层占位符，native 发送前可能继续改写；如果未来某部分网络下沉到 native 且不走当前 JS API，可能漏抓 | 做 LLM trace、参数/返回值跟踪、定位是谁在采集/谁在上报 |
+
+### 5.3 结合 Claude Code 2.1.204 的实际差异
+
+#### 本地 HTTP 代理不是“完全被动旁路”
+
+如果采用类似 cc-viewer 的方案，实质是：
+
+1. 启动一个本地 HTTP 代理。
+2. 把 `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` 注入 Claude Code。
+3. 本地代理收到 Claude Code 的 Anthropic Messages 请求后，再转发到真正 upstream。
+
+这类方案的好处是实现简单、很适合做可视化 viewer；但它不是“零扰动”：
+
+- Claude Code 会把这个本地地址当作自定义 upstream。
+- 一部分 feature gate / 运行条件会跟着切到 custom base URL 分支。
+- 如果代理实现还会附加内部标记（例如 `x-cc-viewer-trace`）或重写 `accept-encoding`，那它看到和转发的报文也已经不是“纯原始样子”。
+
+所以，这种方案更适合“主动代理 + 观测 + 改写”，不适合当作 TLS/线上的绝对真相源。
+
+#### MITM 更接近最终 HTTP 真相，但不保留客户端 TLS 指纹
+
+MITM 抓到的是最终发出的 HTTP body/header，这一点对确认下面这些问题最有价值：
+
+- `cch` 是否已经被 native body-prepare 改写；
+- 1P batch / Datadog / GrowthBook 到底有没有真正上网；
+- 某些 header 是上层 builder 拼的，还是底层在发包前补的。
+
+但只要经过 MITM，上游看到的 TLS ClientHello 就是 MITM 的，不是 Claude Code 原生二进制自己的 JA3 / JA4 / ALPN 组合。因此：
+
+- MITM 适合验证 HTTP 层真相；
+- 不适合验证 TLS 指纹真相。
+
+#### JS preload 最适合做 LLM trace
+
+如果目标是“看到每一轮和模型交互的具体 message list、system、tools、响应文本”，preload 是三者里最顺手的：
+
+- 可以直接在同进程拿到 `/v1/messages` body；
+- 不需要把 JSON 再从 HAR 里反解；
+- 可以把请求和响应按 Claude 语义格式化出来；
+- 还可以继续往上追到调用该请求的模块、对象和参数。
+
+但它的边界也要说清楚：
+
+- 它更像“应用层视角”，不是“网卡视角”；
+- 对 native 发送前的最终二次加工，必须再拿 MITM 或 native hook 去交叉验证。
+
+### 5.4 我们当前这套工程里的建议分工
+
+| 目标 | 推荐方案 |
+|---|---|
+| 看最终 HTTP 请求/响应到底发了什么 | MITM |
+| 看 `system/messages/tools` 和模型响应内容 | JS preload + `bin/show-llm-trace` |
+| 想在线改写请求、做转发器、做 viewer | 本地 HTTP 代理（`ANTHROPIC_BASE_URL`） |
+| 想同时审计三条遥测链是否真的上报 | MITM 或同进程 network trace；优先 MITM 确认最终报文 |
+| 想确认 native 是否在发包前改了 body/header | MITM + preload 双跑，对照上层视图与最终视图 |
+| 想分析 JA3 / JA4 / TLS ClientHello | 上面三种都不够；需要官方直连 + 抓原始流量（如 `tcpdump` / `pcap`），避免 MITM 和本地代理改写 TLS |
+
+### 5.5 结论
+
+一句话压缩：
+
+- 本地 HTTP 代理最适合“接管和改写模型请求”。
+- MITM 最适合“看最终 HTTP 真相”和“做三条遥测链全量审计”。
+- JS preload 最适合“做 LLM trace”和“追调用链/采集源头”。
+
+因此，当前仓库把 JS preload 作为默认入口，把 network JSONL 当“应用层真相源”；如果要确认最终线上报文，再用 MITM 做交叉验证。两者叠加，基本能把 Claude Code 2.1.204 的模型请求、1P event、Datadog 和 GrowthBook 看全。
+
+## 6. 证据文件
 
 ### JSONL
 
@@ -795,7 +887,7 @@ cachedExperimentFeatures = null
 
 - `~/.claude.json.cachedGrowthBookFeatures`：当前 13 个 feature 的真实本地生效值。
 
-## 6. 最终判断
+## 7. 最终判断
 
 1. **1P Event Logging 是最完整的产品事件主链**：事件数量多、字段丰富、支持 batch/retry/失败落盘；GrowthBook 曝光也复用它。
 2. **Datadog 是 1P 事件流的受限子集/旁路 sink**：受 feature flag、provider、事件 allowlist 和 Claude 模型名共同限制，字段被扁平化以便日志检索。
