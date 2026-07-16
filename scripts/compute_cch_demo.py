@@ -5,16 +5,17 @@ Compute Claude Code 2.1.204 `cch` from a captured request body.
 What this script implements:
 
 - normalize `cch=<value>` to `cch=00000`
-- find the top-level `"model":"<value>"` field
-- compute XXH64 with seed 0x4d659218e32a3268 while skipping only the model
-  value bytes
+- omit each `"model":"<value>"` string value from the hash input
+- omit complete `fallbacks`, `fallback_credit_token`, and numeric `max_tokens`
+  fields when present
+- compute XXH64 with seed 0x4d659218e32a3268 over the canonicalized bytes
 - return the low 20 bits as 5 lowercase hex characters
 
 By default, the script validates against a real captured request body stored in:
 
   traces/cch_pair2/claude-network-1784023170915-68494.jsonl
 
-The expected `cch` for that request is `d1a7a`.
+The expected `cch` for that request is `6c6e4`.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ DEFAULT_JSONL = (
     / "cch_pair2"
     / "claude-network-1784023170915-68494.jsonl"
 )
-DEFAULT_EXPECTED_CCH = "d1a7a"
+DEFAULT_EXPECTED_CCH = "6c6e4"
 
 
 def rotl64(value: int, bits: int) -> int:
@@ -131,42 +132,187 @@ def normalize_cch_placeholder(body: bytes) -> bytes:
     return re.sub(rb"cch=[0-9a-z]{5}", b"cch=00000", body)
 
 
-def remove_model_value_bytes(body: bytes) -> tuple[bytes, str]:
+def trim_field_range(
+    body: bytes,
+    field_start: int,
+    value_end: int,
+    scan_start: int,
+) -> tuple[int, int]:
+    if value_end < len(body) and body[value_end] == 0x2C:
+        return field_start, value_end + 1
+    if field_start > scan_start and body[field_start - 1] == 0x2C:
+        return field_start - 1, value_end
+    return field_start, value_end
+
+
+def find_model_omission(body: bytes, scan_start: int) -> tuple[int, int, str] | None:
     anchor = b'"model":"'
-    start_anchor = body.find(anchor)
-    if start_anchor < 0:
-        raise ValueError('top-level `"model":"` anchor not found')
+    anchor_start = body.find(anchor, scan_start)
+    if anchor_start < 0:
+        return None
 
-    value_start = start_anchor + len(anchor)
-    index = value_start
-    escaped = False
-    while index < len(body):
-        current = body[index]
-        if escaped:
-            escaped = False
-        elif current == 0x5C:  # backslash
-            escaped = True
-        elif current == 0x22:  # double quote
-            value_end = index
-            model_value = body[value_start:value_end].decode("utf-8")
-            return body[:value_start] + body[value_end:], model_value
-        index += 1
+    value_start = anchor_start + len(anchor)
+    value_end = body.find(b'"', value_start)
+    if value_end < 0:
+        return None
 
-    raise ValueError("model closing quote not found")
+    value = body[value_start:value_end].decode("utf-8", errors="replace")
+    return value_start, value_end, value
 
 
-def compute_cch(body_text: str) -> dict[str, str | int]:
+def find_array_field_omission(
+    body: bytes,
+    anchor: bytes,
+    scan_start: int,
+) -> tuple[int, int] | None:
+    search_start = scan_start
+    while True:
+        field_start = body.find(anchor, search_start)
+        if field_start < 0:
+            return None
+
+        index = field_start + len(anchor)
+        depth = 1
+        in_string = False
+        while index < len(body):
+            current = body[index]
+            if in_string:
+                if current == 0x5C and index + 1 < len(body):
+                    index += 2
+                    continue
+                if current == 0x22:
+                    in_string = False
+            elif current == 0x22:
+                in_string = True
+            elif current == 0x5B:
+                depth += 1
+            elif current == 0x5D:
+                depth -= 1
+                if depth == 0:
+                    return trim_field_range(body, field_start, index + 1, scan_start)
+            index += 1
+
+        search_start = field_start + len(anchor)
+
+
+def find_string_field_omission(
+    body: bytes,
+    anchor: bytes,
+    scan_start: int,
+) -> tuple[int, int] | None:
+    search_start = scan_start
+    while True:
+        field_start = body.find(anchor, search_start)
+        if field_start < 0:
+            return None
+        value_end = body.find(b'"', field_start + len(anchor))
+        if value_end >= 0:
+            return trim_field_range(body, field_start, value_end + 1, scan_start)
+        search_start = field_start + len(anchor)
+
+
+def find_numeric_field_omission(
+    body: bytes,
+    anchor: bytes,
+    scan_start: int,
+) -> tuple[int, int] | None:
+    search_start = scan_start
+    while True:
+        field_start = body.find(anchor, search_start)
+        if field_start < 0:
+            return None
+
+        value_start = field_start + len(anchor)
+        value_end = value_start
+        while value_end < len(body) and 0x30 <= body[value_end] <= 0x39:
+            value_end += 1
+        if value_end > value_start:
+            return trim_field_range(body, field_start, value_end, scan_start)
+        search_start = value_start
+
+
+def find_internal_field_omission(
+    body: bytes,
+    scan_start: int,
+) -> tuple[int, int, str] | None:
+    candidates: list[tuple[int, int, str]] = []
+
+    fallbacks = find_array_field_omission(body, b'"fallbacks":[', scan_start)
+    if fallbacks is not None:
+        candidates.append((*fallbacks, "fallbacks"))
+
+    fallback_credit_token = find_string_field_omission(
+        body,
+        b'"fallback_credit_token":"',
+        scan_start,
+    )
+    if fallback_credit_token is not None:
+        candidates.append((*fallback_credit_token, "fallback_credit_token"))
+
+    max_tokens = find_numeric_field_omission(body, b'"max_tokens":', scan_start)
+    if max_tokens is not None:
+        candidates.append((*max_tokens, "max_tokens"))
+
+    return min(candidates, key=lambda item: item[0]) if candidates else None
+
+
+def canonicalize_cch_input(body: bytes) -> tuple[bytes, list[dict[str, str | int]]]:
+    chunks: list[bytes] = []
+    omissions: list[dict[str, str | int]] = []
+    cursor = 0
+
+    while cursor < len(body):
+        model = find_model_omission(body, cursor)
+        internal = find_internal_field_omission(body, cursor)
+
+        if model is None and internal is None:
+            chunks.append(body[cursor:])
+            break
+
+        if model is not None and (
+            internal is None
+            or model[0] - len(b'"model":"') <= internal[0]
+        ):
+            omit_start, omit_end, value = model
+            name = "model_value"
+        else:
+            assert internal is not None
+            omit_start, omit_end, name = internal
+            value = body[omit_start:omit_end].decode("utf-8", errors="replace")
+
+        chunks.append(body[cursor:omit_start])
+        omissions.append(
+            {
+                "name": name,
+                "start": omit_start,
+                "end": omit_end,
+                "bytes": omit_end - omit_start,
+                "value": value,
+            }
+        )
+        cursor = omit_end
+
+    return b"".join(chunks), omissions
+
+
+def compute_cch(body_text: str) -> dict[str, object]:
     normalized = normalize_cch_placeholder(body_text.encode("utf-8"))
-    hashed_input, model_value = remove_model_value_bytes(normalized)
+    hashed_input, omissions = canonicalize_cch_input(normalized)
     digest = xxh64(hashed_input, SEED)
     low20 = digest & 0xFFFFF
+    model_values = [
+        str(omission["value"])
+        for omission in omissions
+        if omission["name"] == "model_value"
+    ]
     return {
-        "model": model_value,
+        "model": model_values[0] if model_values else "",
         "digest_hex": f"0x{digest:016x}",
         "low20_hex": f"0x{low20:05x}",
         "cch": f"{low20:05x}",
         "normalized_body_bytes": len(normalized),
         "hashed_input_bytes": len(hashed_input),
+        "omissions": omissions,
     }
 
 
@@ -209,6 +355,17 @@ def self_check() -> None:
             f"XXH64 self-check failed: expected 0x{expected:016x}, got 0x{actual:016x}"
         )
 
+    canonicalized, omissions = canonicalize_cch_input(
+        b'{"model":"sonnet","fallbacks":["opus"],"max_tokens":123,'
+        b'"fallback_credit_token":"credit","messages":[]}'
+    )
+    expected_body = b'{"model":"","messages":[]}'
+    if canonicalized != expected_body:
+        raise SystemExit(
+            f"CCH canonicalization self-check failed: expected {expected_body!r}, "
+            f"got {canonicalized!r}; omissions={omissions!r}"
+        )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -248,6 +405,12 @@ def main() -> int:
     print(f"cch: {result['cch']}")
     print(f"normalized_body_bytes: {result['normalized_body_bytes']}")
     print(f"hashed_input_bytes: {result['hashed_input_bytes']}")
+    print("omissions:")
+    for omission in result["omissions"]:
+        print(
+            f"  {omission['name']}: offset={omission['start']}..{omission['end']} "
+            f"bytes={omission['bytes']} value={omission['value']!r}"
+        )
     print("body_prefix:")
     print(body_text[: args.show_body_prefix].replace("\n", "\\n"))
 

@@ -73,7 +73,7 @@
 |---|---|---|
 | `cc_version` | `VERSION + "." + fp3`；其中 `fp3 = sha256("59cf53e54c78" + msg[4] + msg[7] + msg[20] + VERSION).hex().slice(0, 3)` | `2.1.204.5a7`、`2.1.204.9b9` |
 | `cc_entrypoint` | 直接取 `CLAUDE_CODE_ENTRYPOINT` | `sdk-cli` |
-| `cch` | native `sub_10142D258` 中对 prepared JSON body 做 `XXH64(seed=0x4d659218e32a3268)`；跳过 `"model":"<value>"` 的 value，取 digest 低 20 bit 编成 5 位小写 hex，再原地覆写 `cch=00000` | `d004c`、`c1f8f`、`92d13` |
+| `cch` | native `sub_10142D258` 中对 prepared JSON body 的规范化视图做 `XXH64(seed=0x4d659218e32a3268)`：跳过 `"model":"<value>"` 的 value；存在时排除完整的 `fallbacks`、`fallback_credit_token`、数值型 `max_tokens` 字段；取 digest 低 20 bit 编成 5 位小写 hex，再原地覆写 `cch=00000` | `d004c`、`c1f8f`、`92d13`、`1f4b9` |
 
 这里 `msg` 不是 wrapper 后的第一段 `<system-reminder>`，而是“本轮第一个真实用户文本”。当前可复算的两个样例：
 
@@ -101,10 +101,18 @@ function cchValue(preparedBodyBytes) {
   // native sub_10142D258:
   // 1. find "system":[
   // 2. find cch=00000
-  // 3. XXH64(body, seed=0x4d659218e32a3268), but skip `"model":"<value>"` value bytes
-  // 4. return lower 20 bits as five lowercase hex chars
+  // 3. build the XXH64 input view:
+  //    - keep `"model":"` and its closing quote, but skip the value bytes
+  //    - omit complete `fallbacks`, `fallback_credit_token`, and numeric
+  //      `max_tokens` fields, including one adjacent comma, when present
+  // 4. XXH64(canonicalBody, seed=0x4d659218e32a3268)
+  // 5. return lower 20 bits as five lowercase hex chars
 }
 ```
+
+这里的“跳过/排除”只针对送入 XXH64 的字节视图，不会从实际 HTTP body
+中删除字段。普通 `/v1/messages` 请求通常包含 `max_tokens`，但一般不包含
+`fallbacks` 和 `fallback_credit_token`；后两者只在出现时进入排除逻辑。
 
 受控同进程 probe 的直接证据：
 
@@ -112,6 +120,14 @@ function cchValue(preparedBodyBytes) {
 |---|---|---|
 | `0x232b8b0fc55d004c` | `0xd004c` | `cch=d004c` |
 | `0xe8224a7adaac1f8f` | `0xc1f8f` | `cch=c1f8f` |
+
+另一次受控本地 upstream 复现中，请求含
+`"model":"claude-sonnet-4-6"` 和 `"max_tokens":32000`，最终 wire 值为
+`cch=1f4b9`：完整 body 算得 `d9e49`，只跳过 model value 算得 `04563`，
+同时排除 `"max_tokens":32000,` 后 digest 为
+`0xdc2fe934fbc1f4b9`，低 20 bit 才准确命中 `1f4b9`。
+
+可复算实现见 [`scripts/compute_cch_demo.py`](../scripts/compute_cch_demo.py)。
 
 #### 其他常见 model request header / probe 生成方式
 

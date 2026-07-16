@@ -17,8 +17,10 @@ The final answer for Claude Code 2.1.204 is:
 
 - the placeholder `cch=00000` exists before final serialization,
 - the real value is written inside `sub_10142D258` (RVA `0x142d258`),
-- the function computes `XXH64` over the prepared JSON body, skipping the
-  `"model":"<value>"` string value, and overwrites the placeholder in place.
+- the function computes `XXH64` over a canonicalized view of the prepared JSON
+  body: it skips each `"model":"<value>"` string value and omits complete
+  `fallbacks`, `fallback_credit_token`, and numeric `max_tokens` fields when
+  present, then overwrites the placeholder in place.
 
 ## Step 1: prove the JavaScript view is incomplete
 
@@ -53,6 +55,9 @@ The candidate routine had to be able to see all of the following in one place:
 - `cch=00000`
 - `"system":[`
 - `"model":"`
+- `"fallbacks":[`
+- `"fallback_credit_token":"`
+- `"max_tokens":`
 
 Those anchors imply a routine that operates on the prepared JSON request body,
 not just on abstract request metadata and not only on raw socket fragments.
@@ -93,6 +98,7 @@ After narrowing to `sub_10142D258`, we hooked helper routines reached from that
 path:
 
 - a `memmem`-like search helper
+- `sub_101435960`, which locates internal routing/budget fields to omit
 - `XXH64` init / update / digest helpers
 
 The probe emits backtraces and return RVAs so we can correlate helper calls with
@@ -102,10 +108,19 @@ What we observed:
 
 - the search helper was used from the candidate path to find body substrings,
   including the `"model":"` anchor;
+- the code hashes bytes up to the start of a model value, resumes at its closing
+  quote, and therefore retains the field syntax while omitting only the value;
+- `sub_101435960` searches for `"fallbacks":[`,
+  `"fallback_credit_token":"`, and numeric `"max_tokens":` fields; the caller
+  hashes up to the returned range and resumes after it, omitting the complete
+  field and one adjacent comma;
 - `XXH64` was initialized from the same path with seed
   `0x4d659218e32a3268`;
 - the digest’s low 20 bits matched the 5 lowercase hex characters written into
   `cch=00000`.
+
+The omissions affect only the bytes fed to XXH64. The request body itself still
+contains fields such as `model` and `max_tokens` when it is sent.
 
 Two direct dynamic examples:
 
@@ -113,6 +128,20 @@ Two direct dynamic examples:
 |---|---|---|
 | `0x232b8b0fc55d004c` | `0xd004c` | `cch=d004c` |
 | `0xe8224a7adaac1f8f` | `0xc1f8f` | `cch=c1f8f` |
+
+A controlled local-upstream run also tested the canonicalization against the
+actual outbound body. That request contained `model = claude-sonnet-4-6` and
+`max_tokens = 32000`; the wire value was `cch=1f4b9`:
+
+| Hash input | XXH64 digest | Low 20 bits | Matches wire |
+|---|---|---|---|
+| Full body with `cch=00000` | `0xa745d9d6591d9e49` | `d9e49` | No |
+| Skip only the model value | `0x506e5056e9804563` | `04563` | No |
+| Skip the model value and omit `"max_tokens":32000,` | `0xdc2fe934fbc1f4b9` | `1f4b9` | Yes |
+
+The normal request did not contain `fallbacks` or `fallback_credit_token`, so
+their omission is established statically by the same native range-selection
+path rather than exercised by this particular wire sample.
 
 ## Step 5: rule out the “ordinary JS hash” explanation
 
