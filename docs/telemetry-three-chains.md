@@ -25,6 +25,27 @@
 - GrowthBook `/api/eval` 的 `attributes` 在官方直连样本里出现 `organizationUUID`、`accountUUID`、`subscriptionType`、`rateLimitTier`，同时不再出现自定义 upstream 才会有的 `apiBaseUrlHost`；旧 DeepSeek 样本刚好相反。
 - 官方直连的 proxy 样本在 `system[0].text` 中真实看到了 `x-anthropic-billing-header: ... cch=00000;` 占位符；旧 DeepSeek proxy 样本在同层没有观察到这一占位符。这个差异只说明“上层 request builder 可见性”不同，不改变最终 `cch` 仍由 native body-prepare 改写的结论。
 
+### 可据参数反推的使用场景
+
+下面这些字段，已经足够用来对“这台 Claude Code 正处在哪类使用场景”做高置信分类：
+
+| 链路 | 参数 | 能反推出的场景 | 当前样本/判定规则 |
+|---|---|---|---|
+| 1P Event | `additional_metadata.baseUrl` | 官方直连 vs 自定义 upstream / 中转站 | 官方域名保留明文 URL；非官方域名会变成 12 位 SHA-256 前缀。`efdbb18afca7` 可反推出当前不是直连 `api.anthropic.com`，而是自定义 `https://api.deepseek.com/anthropic` |
+| GrowthBook | `attributes.apiBaseUrlHost` | 是否在用自定义 API host | 该字段只在自定义 `ANTHROPIC_BASE_URL` 时出现；DeepSeek 样本为 `api.deepseek.com`，官方直连样本不出现 |
+| 1P / GrowthBook | `env.is_claude_ai_auth`、`auth.account_uuid`、`auth.organization_uuid`、`attributes.accountUUID`、`attributes.organizationUUID`、`subscriptionType`、`rateLimitTier` | 是否处于“Claude 官方账号登录态 / 官方订阅态” | 官方直连样本这些字段真实出现；DeepSeek 样本里 `env.is_claude_ai_auth=false`，且缺少 account/org/subscription/rateLimitTier |
+| 1P / Datadog | `entrypoint`、`client_type`、`querySource`、`is_interactive`、`print`、`isTTY` | 人工交互 CLI vs SDK/headless 自动化 | 例如 `entrypoint=sdk-cli`、`querySource=sdk`、`isTTY=false`、`print=true`，很像脚本/SDK 驱动；而 `querySource=repl_main_thread`、`isTTY=true` 更接近人工终端交互 |
+| 1P / Datadog / GrowthBook | `env.is_ci`、`env.is_github_action`、`env.is_claude_code_action`、`attributes.githubActionsMetadata` | CI / GitHub Actions / 托管自动化环境 | 当前本机样本均为 `false`，所以可排除这类托管 CI 场景 |
+| Datadog | `permission_mode`、`sandboxed`、`sandbox_enabled`、`filesystem_policy`、`destructive_category` | 本地工具执行时的权限/沙箱治理场景 | 当前样本 `permission_mode=default`、`sandboxed=false`、`filesystem_policy=strict`，说明是本地 CLI 工具执行，但不是额外沙箱托管态 |
+
+实践里最好把这些信号组合看，而不是只看单一字段：
+
+- 想判断“是不是官方账号直连”，优先组合看 `env.is_claude_ai_auth` + GrowthBook 是否出现 `accountUUID` / `organizationUUID` + 1P 的 `baseUrl` 是否仍是官方域名。
+- 想判断“是不是第三方兼容 upstream / 中转站”，优先看 1P 的 `baseUrl` 哈希化结果，以及 GrowthBook 是否出现明文 `apiBaseUrlHost`。
+- 想判断“是不是人工在终端里用”，优先看 `isTTY`、`is_interactive`、`querySource`、`print` 这一组，而不是只看 `entrypoint`。
+
+补一个边界：`CLAUDE_CODE_ENVIRONMENT_KIND == "byoc"` 在 2.1.204 里目前更像 Datadog 发送门控，而不是这三条链里稳定、显式上报给服务端的独立字段。也就是说，单看线上包，不一定能直接看到一个明确的 `"byoc"` 字样；更多是通过“哪些链会发、哪些字段会缺失、当前 auth / upstream 组合”去侧推。
+
 ## 共同前置概念
 
 ### `firstParty` 不等于官方直连
